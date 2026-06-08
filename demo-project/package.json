@@ -1,0 +1,10 @@
+{
+  "name": "demo-project",
+  "version": "1.0.0",
+  "description": "A minimal test project for the AI coding collaboration tool",
+  "main": "index.js",
+  "scripts": {
+    "test": "node test.js"
+  },
+  "license": "MIT"
+}
