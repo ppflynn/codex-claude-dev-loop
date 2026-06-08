@@ -101,6 +101,12 @@ You are implementing a development plan for the current project.
 - Only create/modify files that are directly needed to implement the plan
 "@
 
+# Remove old implementation report to prevent false success detection
+# (P1-1: stale report from a previous run could mask a failed task)
+if (Test-Path "docs/IMPLEMENTATION_REPORT.md") {
+    Remove-Item "docs/IMPLEMENTATION_REPORT.md" -Force
+}
+
 $logFile = "docs/claude-run.log"
 $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 
@@ -171,7 +177,9 @@ if ($exitCode -eq 0) {
         $exitCode = 3
     }
 
-    Write-Host " Please verify changes with: git status" -ForegroundColor Yellow
+    Write-Host " Please verify changes with:" -ForegroundColor Yellow
+    Write-Host "   git status --short --untracked-files=all" -ForegroundColor Yellow
+    Write-Host "   git diff" -ForegroundColor Yellow
 } else {
     Write-Host " Claude Code exited with code: $exitCode" -ForegroundColor Red
 }

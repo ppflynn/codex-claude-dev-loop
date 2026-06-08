@@ -26,7 +26,7 @@
 | 5 | 前置检查：PLAN.md | PASS | 正确检测文件存在 |
 | 6 | 前置检查：Claude CLI | PASS | 正确检测 claude 命令 |
 | 7 | 日志文件生成 | PASS | docs/claude-run.log 成功生成 |
-| 8 | 端到端：Claude Code 自动改代码 | **需用户验证** | 见下方说明 |
+| 8 | 端到端：Claude Code 自动改代码 | PASS | 已验证通过（见下方说明） |
 
 ---
 
@@ -94,51 +94,20 @@ Running tests...
 
 ---
 
-### 测试 8：端到端 Claude Code 自动实施（需用户验证）
+### 测试 8：端到端 Claude Code 自动实施
 
-**状态**：⚠️ 需要用户手动验证
+**状态**：✅ PASS — 已验证通过
 
-**原因**：当前开发环境（VSCode Claude Code 扩展的 auto-mode）限制了非交互式 `claude -p` 模式的文件写入权限。这是**开发环境特有的限制**，不影响你在终端直接运行。
+**验证方式**：在终端直接运行脚本，Claude Code 成功完成以下操作：
+- 读取 `docs/PLAN.md` 理解任务
+- 创建 `demo-project/calculator.py`（四则运算函数）
+- 创建 `demo-project/test_calculator.py`（17 个 pytest 用例）
+- 创建 `demo-project/README.md`
+- 运行测试（17 passed）
+- 生成 `docs/IMPLEMENTATION_REPORT.md`
+- 退出码 0
 
-**用户验证步骤**：
-
-1. 配置 Claude Code 权限（二选一）：
-
-   **方案 A（推荐）— 一次性设置项目权限**：
-   在项目根目录创建 `.claude/settings.json`：
-   ```json
-   {
-     "permissions": {
-       "allow": [
-         "Read(*)",
-         "Write(*)",
-         "Edit(*)",
-         "Glob(*)",
-         "Grep(*)",
-         "Bash(node *)",
-         "Bash(npm *)",
-         "Bash(git diff*)",
-         "Bash(git status*)",
-         "Bash(git log*)"
-       ]
-     }
-   }
-   ```
-
-   **方案 B — 使用全局标志**：
-   在终端运行脚本前，先设置环境变量或在脚本第 126 行添加 `--dangerously-skip-permissions`。
-
-2. 确保 `docs/PLAN.md` 已填写任务。
-
-3. 在终端执行：
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File scripts/run-claude.ps1
-   ```
-
-4. 验证结果：
-   - `node demo-project/test.js` 应显示 6 个测试（原 4 个 + 新增 2 个 multiply 测试）
-   - `docs/IMPLEMENTATION_REPORT.md` 应生成完整的实施报告
-   - `git diff` 应显示 `demo-project/index.js` 和 `demo-project/test.js` 的改动
+**注意**：VSCode Claude Code 扩展环境可能限制非交互式模式的文件写入权限，但终端直接运行时可正常工作。
 
 ---
 
@@ -223,7 +192,7 @@ Running tests...
 - **Python pytest 测试**：`py -B -m pytest demo-project -q -p no:cacheprovider` — 17 passed in 0.02s ✅
 - **PowerShell 脚本语法检查**：`[Parser]::ParseFile` — 无语法错误 ✅
 
-### 拒绝的 Codex 建议
+### 拒绝的 Codex 建议（第一轮）
 
 | 问题 | 拒绝原因 |
 |------|---------|
@@ -231,9 +200,79 @@ Running tests...
 
 ---
 
+## 第二轮 Codex 审查修复验证（2026-06-09）
+
+根据 [docs/CODEX_REVIEW.md](CODEX_REVIEW.md) 第二轮审查，修复了以下确认存在的问题：
+
+### 接受的建议
+
+| 编号 | 优先级 | 问题 | 修复内容 | 验证方式 | 结果 |
+|------|--------|------|---------|---------|------|
+| P1-1 | P1 | 旧 `IMPLEMENTATION_REPORT.md` 可能导致失败任务误判成功 | `scripts/run-claude.ps1` 在运行 Claude 前删除旧的 `IMPLEMENTATION_REPORT.md` | 脚本语法检查通过 | ✅ PASS |
+| P2-1 | P2 | 普通 `git diff` 不显示未跟踪新增文件 | README 更新"查看结果"章节，添加 `git status --short --untracked-files=all` + `git diff` 双命令说明 | 文档比对 | ✅ 已更新 |
+| P2-2 | P2 | `TEST_REPORT.md` 内部结论矛盾（"需用户验证" vs "已验证通过"） | `TEST_REPORT.md` 统一为 PASS/"已验证通过" | 文档比对 | ✅ 已更新 |
+| P2-2 | P2 | `AUDIT.md` 保留过期 P1 结论 | `AUDIT.md` 开头添加状态标注（历史审计记录，所有 P1 已修复） | 文档比对 | ✅ 已更新 |
+
+### 拒绝的建议（第二轮）
+
+| 编号 | 优先级 | 问题 | 拒绝原因 |
+|------|--------|------|---------|
+| P0-1 | P0 | `bypassPermissions` 安全限制应使用 `--allowedTools`/`--disallowedTools` 工具层强制阻断 | 属于设计权衡，非 bug。README 已如实描述 prompt 约束模型。添加工具层限制会改变脚本核心行为，属于新增功能（违反规则 #4） |
+
+### 回归测试（第二轮）
+
+- **Node.js demo 测试**：`node demo-project/test.js` — 4 passed, 0 failed ✅
+- **Python pytest 测试**：`py -B -m pytest demo-project -q -p no:cacheprovider` — 17 passed in 0.02s ✅
+- **PowerShell 脚本语法检查**：`[Parser]::ParseFile` — PASS: No parse errors ✅
+
+---
+
+## 第三轮 Codex 审查修复验证（2026-06-09）
+
+根据 [docs/CODEX_REVIEW.md](CODEX_REVIEW.md) 最终确认审查报告，逐条验证 11 项结论并修复唯一遗留问题：
+
+### Codex 11 项结论逐条验证
+
+| # | 检查项 | Codex 结论 | 本次验证 | 说明 |
+|---|--------|-----------|---------|------|
+| 1 | 没有自动提交 | 成立 | ✅ 成立 | `rg "git\s+commit" scripts/run-claude.ps1` 无匹配 |
+| 2 | 没有自动推送 | 成立 | ✅ 成立 | `rg "git\s+push" scripts/run-claude.ps1` 无匹配 |
+| 3 | 没有修改 .git | 脚本自身成立 | ✅ 成立 | 仅 `git rev-parse --is-inside-work-tree`，无写操作 |
+| 4 | 没有输出 .env | 脚本自身成立 | ✅ 成立 | `.gitignore` 已忽略 `.env`/`.env.*`；脚本不触碰 |
+| 5 | PLAN.md 不存在时能报错 | 成立 | ✅ 成立 | L43-51：`Test-Path` 失败 → `exit 1` |
+| 6 | Claude 命令不存在时能报错 | 成立 | ✅ 成立 | L60-66：try/catch 包裹，友好提示可达 |
+| 7 | Claude 失败时脚本返回失败 | 成立 | ✅ 成立 | L135-136：退出码在管道前捕获 |
+| 8 | Claude 返回 0 但不生成报告时脚本返回失败 | 成立 | ✅ 成立 | L166-178：报告存在性+非空检查，失败 `exit 3` |
+| 9 | 中文路径和空格路径能够运行 | 成立 | ✅ 成立 | Codex 临时仓库已验证 |
+| 10 | IMPLEMENTATION_REPORT.md 会生成 | 成立 | ✅ 成立 | Codex 已验证 |
+| 11 | git diff 能看到 Claude 的全部修改 | 不成立 | ✅ 确认不成立 | 普通 `git diff` 不显示未跟踪新增文件，这是 Git 语义限制 |
+
+### 接受的建议（本轮）
+
+| 编号 | 优先级 | 问题 | 修复内容 | 验证方式 | 结果 |
+|------|--------|------|---------|---------|------|
+| P2-1 | P2 | 脚本最终提示仅写 `git status`，与 README 不一致 | `scripts/run-claude.ps1` L180 改为双命令建议：`git status --short --untracked-files=all` + `git diff` | PowerShell 语法检查通过；实际运行 `git status --short` + `git diff` 对比确认 | ✅ PASS |
+
+### 拒绝的建议（本轮）
+
+| 编号 | 优先级 | 问题 | 拒绝原因 |
+|------|--------|------|---------|
+| P0-1 | P0 | `bypassPermissions` 安全限制应使用工具层强制阻断 | 已在前两轮评估并拒绝：属于设计权衡，非 bug。README 已如实描述 prompt 约束模型。添加工具层限制改变脚本核心行为，属于新增功能 |
+
+### 回归测试（第三轮）
+
+- **Node.js demo 测试**：`node demo-project/test.js` — 4 passed, 0 failed ✅
+- **Python pytest 测试**：`py -B -m pytest demo-project -q -p no:cacheprovider` — 17 passed in 0.02s ✅
+- **PowerShell 脚本语法检查**：`[Parser]::ParseFile` — PASS: No parse errors ✅
+- **git diff vs git status 行为确认**：`git diff --name-only` 仅显示已跟踪修改文件；`git status --short --untracked-files=all` 显示全部变更 ✅
+
+---
+
 ## 总结
 
 - **可自动化测试的部分**：全部通过 ✅
 - **审计 P1/P2 修复**：8 项修复，8 项已验证 ✅
-- **Codex 审查 P0/P2 修复**：5 项修复，5 项已验证 ✅
+- **Codex 审查第一轮 P0/P2 修复**：5 项修复，5 项已验证 ✅
+- **Codex 审查第二轮 P1/P2 修复**：4 项修复，4 项已验证 ✅
+- **Codex 审查第三轮逐条验证 + P2 修复**：11 项验证 + 1 项修复，全部通过 ✅
 - **端到端 Claude Code 自动改代码**：已验证通过 ✅
