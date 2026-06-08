@@ -268,6 +268,40 @@ Running tests...
 
 ---
 
+## 第四轮 Codex 审查修复验证（2026-06-09）
+
+根据 [docs/CODEX_REVIEW.md](CODEX_REVIEW.md)（精简版），逐条对照 5 条验收标准验证并修复唯一缺失项：
+
+### 验收标准逐条验证
+
+| # | 验收标准 | 验证结果 | 说明 |
+|---|---------|---------|------|
+| 1 | README 不表达"只看 git diff 就能看到全部修改" | ✅ 已满足 | README L67 明确警告"普通 `git diff` 不显示未跟踪的新增文件" |
+| 2 | README 明确推荐 `git status --short --untracked-files=all` + `git diff` | ✅ 已满足 | README L64-65 双命令推荐 |
+| 3 | 脚本结束提示推荐以上两条命令 | ✅ 已满足 | `scripts/run-claude.ps1` L180-182 三行双命令提示 |
+| 4 | 对未跟踪新增文件的处理方式写清楚 | ⚠️ 缺失 → ✅ 已修复 | README L67 补充：直接读取文件内容审查，或 `git add -N <path>` 后查看 diff |
+| 5 | 不新增 MCP/Web/DB/多Agent/重构 | ✅ 遵守 | 仅修改 README 一行说明文字 |
+
+### 接受的建议（本轮）
+
+| 编号 | 优先级 | 问题 | 修复内容 | 验证方式 | 结果 |
+|------|--------|------|---------|---------|------|
+| P2-1 | P2 | README 未说明未跟踪新增文件的处理方式（验收标准 #4） | README L67 补充未跟踪文件处理说明：直接读取内容或 `git add -N` 后 diff | 文档比对 | ✅ 已更新 |
+
+### 拒绝的建议（本轮）
+
+| 编号 | 优先级 | 问题 | 拒绝原因 |
+|------|--------|------|---------|
+| — | — | 无 | CODEX_REVIEW.md 本次仅要求两个 P2 文档修正，已全部满足 |
+
+### 回归测试（第四轮）
+
+- **Node.js demo 测试**：`node demo-project/test.js` — 4 passed, 0 failed ✅
+- **Python pytest 测试**：`py -B -m pytest demo-project -q -p no:cacheprovider` — 17 passed in 0.02s ✅
+- **PowerShell 脚本语法检查**：`[Parser]::ParseFile` — PASS: No parse errors ✅
+
+---
+
 ## 总结
 
 - **可自动化测试的部分**：全部通过 ✅
@@ -275,4 +309,5 @@ Running tests...
 - **Codex 审查第一轮 P0/P2 修复**：5 项修复，5 项已验证 ✅
 - **Codex 审查第二轮 P1/P2 修复**：4 项修复，4 项已验证 ✅
 - **Codex 审查第三轮逐条验证 + P2 修复**：11 项验证 + 1 项修复，全部通过 ✅
+- **Codex 审查第四轮验收标准验证 + P2 修复**：5 条验收标准逐条验证 + 1 项修复，全部通过 ✅
 - **端到端 Claude Code 自动改代码**：已验证通过 ✅

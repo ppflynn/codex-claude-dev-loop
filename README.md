@@ -64,7 +64,7 @@ powershell -ExecutionPolicy Bypass -File scripts\run-claude.ps1
   git status --short --untracked-files=all   # 查看所有变更（含新增文件）
   git diff                                   # 查看已跟踪文件的修改细节
   ```
-  > **注意**：普通 `git diff` 不显示未跟踪的新增文件。如需完整审查 Claude 所有改动，请同时使用以上两条命令。
+  > **注意**：普通 `git diff` 不显示未跟踪的新增文件。如需完整审查 Claude 所有改动，请同时使用以上两条命令。对未跟踪的新增文件（`git status` 中显示为 `??` 的文件），直接读取文件内容进行审查，或使用 `git add -N <path>` 后再通过 `git diff` 查看。
 - 实施报告：`docs\IMPLEMENTATION_REPORT.md`
 - 执行日志：`docs\claude-run.log`
 
