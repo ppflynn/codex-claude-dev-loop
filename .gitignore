@@ -13,6 +13,12 @@ __pycache__/
 docs/claude-run.log
 docs/IMPLEMENTATION_REPORT.md
 docs/CODEX_REVIEW.md
+.gui/
 
-# User local configuration
-.claude/
+# Test artifacts (fake claude binaries for orchestrator tests)
+claude.cmd
+claude.bat
+
+# User local configuration (keep settings.json committed for project-level safety)
+.claude/*
+!.claude/settings.json

@@ -1,6 +1,7 @@
 # 代码审查报告
 
-> 此文件由 Codex 生成。基于 `git diff` 的输出进行审查。
+> 此文件由 Codex 生成。基于 `git status --short --untracked-files=all` + `git diff` 的输出进行审查。
+> 对未跟踪的新增文件（`??`），直接读取文件内容进行审查。
 > 审查完成后，Claude Code 会读取此文件进行修复。
 
 ---
@@ -8,7 +9,7 @@
 ## 审查信息
 
 - **审查时间**：[自动填入]
-- **审查范围**：[git diff 输出]
+- **审查范围**：[git status --short --untracked-files=all + git diff 输出]
 - **审查者**：Codex
 
 ## 发现的问题

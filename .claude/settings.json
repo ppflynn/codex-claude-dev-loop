@@ -1,0 +1,25 @@
+{
+  "description": "Claude Code project-level settings for AI Coding Collaboration CLI Orchestrator. Provides tool-layer safety enforcement in addition to prompt-based safety rules.",
+  "permissions": {
+    "allow": [
+      "Read",
+      "Write",
+      "Edit",
+      "Glob",
+      "Grep"
+    ],
+    "deny": [
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(git reset --hard:*)",
+      "Bash(git clean:*)",
+      "Bash(rm -rf:*)",
+      "Bash(del /f:*)",
+      "Bash(Remove-Item .git:*)",
+      "Read(.env:*)",
+      "Read(**/.env:*)",
+      "Write(.env:*)",
+      "Write(**/.env:*)"
+    ]
+  }
+}
