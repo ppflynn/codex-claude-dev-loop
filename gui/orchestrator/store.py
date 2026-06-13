@@ -52,7 +52,7 @@ class TaskStore:
     def _read_task_json(self, path: Path) -> Task:
         return Task.from_dict(json.loads(path.read_text(encoding="utf-8-sig")))
 
-    def list_tasks(self, *, archived: bool = False) -> list[Task]:
+    def list_tasks(self, *, archived: bool = False, project_id: str | None = None) -> list[Task]:
         with self._lock:
             if not self.tasks_root.exists():
                 return []
@@ -65,6 +65,8 @@ class TaskStore:
                 if task.deletedAt:
                     continue
                 if bool(task.archivedAt) != archived:
+                    continue
+                if project_id and task.projectId != project_id:
                     continue
                 tasks.append(task)
             return tasks

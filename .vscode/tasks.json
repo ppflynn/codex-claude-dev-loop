@@ -1,0 +1,91 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "vscode-extension: compile",
+      "type": "shell",
+      "command": "npm.cmd",
+      "args": [
+        "run",
+        "compile"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/vscode-extension"
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": {
+        "base": "$tsc",
+        "fileLocation": [
+          "relative",
+          "${workspaceFolder}/vscode-extension"
+        ]
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    },
+    {
+      "label": "vscode-extension: watch",
+      "type": "shell",
+      "command": "npm.cmd",
+      "args": [
+        "run",
+        "watch"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/vscode-extension"
+      },
+      "isBackground": true,
+      "problemMatcher": {
+        "base": "$tsc-watch",
+        "fileLocation": [
+          "relative",
+          "${workspaceFolder}/vscode-extension"
+        ]
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    },
+    {
+      "label": "vscode-extension: test",
+      "type": "shell",
+      "command": "npm.cmd",
+      "args": [
+        "test"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/vscode-extension"
+      },
+      "group": "test",
+      "problemMatcher": []
+    },
+    {
+      "label": "dev-loop: start server",
+      "type": "shell",
+      "command": "powershell.exe",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}/scripts/start-gui.ps1",
+        "-Port",
+        "8787"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "problemMatcher": []
+    }
+  ]
+}
