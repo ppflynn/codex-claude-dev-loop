@@ -1,4 +1,5 @@
 import shutil
+import os
 import sys
 import time
 import unittest
@@ -193,6 +194,9 @@ class TaskApiCoreTests(unittest.TestCase):
 
         self.assertEqual(updated.status, "WAITING_FOR_CODEX")
         self.assertTrue((task_dir / "CODEX_REVIEW_PROMPT.md").exists())
+        prompt = (task_dir / "CODEX_REVIEW_PROMPT.md").read_text(encoding="utf-8")
+        self.assertIn("Do not edit files. The launcher will save your final response", prompt)
+        self.assertNotIn("Write the final structured review JSON", prompt)
 
     def test_codex_pass_enters_terminal_pass(self):
         _root, _project, project_store, task_store = self.make_project_store()
@@ -243,6 +247,40 @@ class TaskApiCoreTests(unittest.TestCase):
         task2 = self.create_waiting_task(project_store, task_store)
         cancelled = server.cancel_task(task2.id, task_store)
         self.assertEqual(cancelled.status, "CANCELLED")
+
+    def test_codex_missing_output_returns_to_waiting_for_retry(self):
+        _root, _project, project_store, task_store = self.make_project_store()
+        task = self.create_waiting_task(project_store, task_store)
+        task.status = "CODEX_WINDOW_STARTED"
+        task_store.save(task)
+        task_dir = task_store.task_dir(task.id)
+        (task_dir / "codex_window_round_1.log").write_text("CLI exit code: 1\n", encoding="utf-8")
+
+        with mock.patch("gui.server.assert_git_work_tree"):
+            updated = server.complete_codex_task(task.id, project_store, task_store)
+
+        self.assertEqual(updated.status, "WAITING_FOR_CODEX")
+        self.assertIn("codex_window_round_1.log", [artifact["name"] for artifact in updated.artifacts])
+        self.assertEqual(updated.history[-2]["event"], "CODEX_REVIEW_MISSING")
+
+    def test_codex_stale_output_returns_to_waiting_for_retry(self):
+        _root, _project, project_store, task_store = self.make_project_store()
+        task = self.create_waiting_task(project_store, task_store)
+        task.status = "CODEX_WINDOW_STARTED"
+        task_store.save(task)
+        task_dir = task_store.task_dir(task.id)
+        review_path = task_dir / "CODEX_REVIEW.json"
+        marker_path = task_dir / "codex_output_started_round_1.txt"
+        review_path.write_text('{"status":"BLOCKED","reviewed_at":"old","findings":[]}', encoding="utf-8")
+        marker_path.write_text("marker", encoding="utf-8")
+        old_time = marker_path.stat().st_mtime - 10
+        os.utime(review_path, (old_time, old_time))
+
+        with mock.patch("gui.server.assert_git_work_tree"):
+            updated = server.complete_codex_task(task.id, project_store, task_store)
+
+        self.assertEqual(updated.status, "WAITING_FOR_CODEX")
+        self.assertEqual(updated.history[-2]["event"], "CODEX_REVIEW_MISSING")
 
     def test_running_task_cannot_be_archived_or_deleted(self):
         _root, _project, project_store, task_store = self.make_project_store()

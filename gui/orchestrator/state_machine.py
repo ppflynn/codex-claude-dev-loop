@@ -29,6 +29,7 @@ ALLOWED_TRANSITIONS: Final = {
     Status.CLAUDE_WINDOW_STARTED: {Status.WAITING_FOR_CODEX, Status.FAILED, Status.CANCELLED},
     Status.WAITING_FOR_CODEX: {Status.CODEX_WINDOW_STARTED, Status.CANCELLED},
     Status.CODEX_WINDOW_STARTED: {
+        Status.WAITING_FOR_CODEX,
         Status.PASS,
         Status.NEEDS_FIX,
         Status.BLOCKED,

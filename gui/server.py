@@ -598,6 +598,8 @@ def launch_codex_task(task_id: str, project_store: ProjectStore, task_store: Tas
     settings = load_settings(SETTINGS_FILE)
     adapter = CodexCliWindowAdapter(settings["codexCommand"])
     output_path = task_dir / "CODEX_REVIEW.json"
+    marker_path = task_dir / f"codex_output_started_round_{task.round}.txt"
+    marker_path.write_text(str(time.time()), encoding="utf-8")
     task.codexWindow = adapter.launch(task, task_dir, prompt_path, output_path)
     task.add_artifact(prompt_path.name, prompt_path.name)
     task.add_artifact(Path(task.codexWindow["script"]).name, Path(task.codexWindow["script"]).name)
@@ -613,6 +615,22 @@ def complete_codex_task(task_id: str, project_store: ProjectStore, task_store: T
         raise StateTransitionError(f"Codex can only be completed from {Status.CODEX_WINDOW_STARTED}.")
     task_dir = task_store.task_dir(task.id)
     review_path = task_dir / "CODEX_REVIEW.json"
+    marker_path = task_dir / f"codex_output_started_round_{task.round}.txt"
+    stale_review = (
+        review_path.is_file()
+        and marker_path.is_file()
+        and review_path.stat().st_mtime <= marker_path.stat().st_mtime
+    )
+    if not review_path.is_file() or stale_review:
+        log_path = task_dir / f"codex_window_round_{task.round}.log"
+        detail = "Codex did not create a fresh CODEX_REVIEW.json yet."
+        if log_path.is_file():
+            detail = f"{detail} Check {log_path.name} for the launcher output."
+            task.add_artifact(log_path.name, log_path.name)
+        task.add_history("CODEX_REVIEW_MISSING", detail)
+        set_task_status(task, Status.WAITING_FOR_CODEX, detail)
+        task_store.save(task)
+        return task
     try:
         review = load_review_report(review_path)
     except ReportValidationError as exc:

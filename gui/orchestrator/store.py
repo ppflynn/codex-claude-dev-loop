@@ -49,6 +49,9 @@ class TaskStore:
     def task_json_path(self, task_id: str) -> Path:
         return self.task_dir(task_id) / "task.json"
 
+    def _read_task_json(self, path: Path) -> Task:
+        return Task.from_dict(json.loads(path.read_text(encoding="utf-8-sig")))
+
     def list_tasks(self, *, archived: bool = False) -> list[Task]:
         with self._lock:
             if not self.tasks_root.exists():
@@ -56,7 +59,7 @@ class TaskStore:
             tasks: list[Task] = []
             for path in sorted(self.tasks_root.glob("task_*/task.json"), reverse=True):
                 try:
-                    task = Task.from_dict(json.loads(path.read_text(encoding="utf-8")))
+                    task = self._read_task_json(path)
                 except (OSError, KeyError, TypeError, json.JSONDecodeError, ValueError):
                     continue
                 if task.deletedAt:
@@ -73,7 +76,7 @@ class TaskStore:
             tasks: list[Task] = []
             for path in sorted(self.trash_root.glob("task_*/task.json"), reverse=True):
                 try:
-                    task = Task.from_dict(json.loads(path.read_text(encoding="utf-8")))
+                    task = self._read_task_json(path)
                 except (OSError, KeyError, TypeError, json.JSONDecodeError, ValueError):
                     continue
                 tasks.append(task)
@@ -85,7 +88,7 @@ class TaskStore:
             if not path.is_file():
                 raise TaskStoreError("Task not found.")
             try:
-                return Task.from_dict(json.loads(path.read_text(encoding="utf-8")))
+                return self._read_task_json(path)
             except (KeyError, TypeError, json.JSONDecodeError, ValueError) as exc:
                 raise TaskStoreError("Task file is invalid.") from exc
 
@@ -181,7 +184,7 @@ class TaskStore:
             if not path.is_file():
                 raise TaskStoreError("Trash task not found.")
             try:
-                task = Task.from_dict(json.loads(path.read_text(encoding="utf-8")))
+                task = self._read_task_json(path)
             except (KeyError, TypeError, json.JSONDecodeError, ValueError) as exc:
                 raise TaskStoreError("Trash task file is invalid.") from exc
             destination = self.task_dir(task.id)

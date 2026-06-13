@@ -93,7 +93,7 @@ Target project:
 ## Review Requirements
 - Review the implementation using the Git and test artifacts below.
 - Focus on correctness, regressions, missing tests, and security-sensitive behavior.
-- Write the final structured review JSON to:
+- Do not edit files. The launcher will save your final response to:
   `{output_path}`
 - Return only the same JSON object as the final response. Do not wrap it in Markdown fences or add any prose.
 - Allowed statuses: `PASS`, `NEEDS_FIX`, `BLOCKED`, `FAILED`.

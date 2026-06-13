@@ -36,6 +36,20 @@ class TaskStoreTests(unittest.TestCase):
         self.assertEqual(loaded.status, "WAITING_FOR_CLAUDE")
         self.assertEqual([item.id for item in self.store.list_tasks()], [task.id])
 
+    def test_loads_task_json_with_utf8_bom(self):
+        task = self.store.create(
+            project_id="project1",
+            project_path=str(self.root / "project"),
+            title="BOM task",
+            description="Do work",
+            acceptance="Pass tests",
+        )
+        task_path = self.store.task_json_path(task.id)
+        task_path.write_text(json.dumps(task.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8-sig")
+
+        self.assertEqual(self.store.load(task.id).title, "BOM task")
+        self.assertEqual([item.id for item in self.store.list_tasks()], [task.id])
+
     def test_task_id_cannot_escape_tasks_root(self):
         with self.assertRaises(TaskStoreError):
             self.store.task_dir("task_../escape")
