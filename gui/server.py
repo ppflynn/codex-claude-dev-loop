@@ -870,7 +870,8 @@ class GuiHandler(BaseHTTPRequestHandler):
                 self.send_json({"projects": self.store.list_projects()})
             elif path == "/api/tasks":
                 archived = query.get("archived", ["0"])[0] in {"1", "true", "yes"}
-                self.send_json({"tasks": [task.to_dict() for task in self.tasks.list_tasks(archived=archived)]})
+                project = query.get("project", [None])[0] or None
+                self.send_json({"tasks": [task.to_dict() for task in self.tasks.list_tasks(archived=archived, project_id=project)]})
             elif path == "/api/trash/tasks":
                 self.send_json({"tasks": [task.to_dict() for task in self.tasks.list_trash_tasks()]})
             elif match := re.fullmatch(r"/api/tasks/([^/]+)", path):

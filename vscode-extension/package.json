@@ -1,0 +1,130 @@
+{
+  "name": "codex-claude-dev-loop",
+  "displayName": "Codex-Claude Dev Loop",
+  "description": "VS Code extension for the Codex-Claude Dev Loop workflow",
+  "version": "0.1.0",
+  "publisher": "codex-claude-dev-loop",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onView:codexClaudeDevLoop.tasks"
+  ],
+  "main": "./out/src/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "codexClaudeDevLoop",
+          "title": "AI Dev Loop",
+          "icon": "resources/ai-dev-loop.svg"
+        }
+      ]
+    },
+    "views": {
+      "codexClaudeDevLoop": [
+        {
+          "id": "codexClaudeDevLoop.tasks",
+          "name": "Tasks"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "codexClaudeDevLoop.refreshTasks",
+        "title": "Refresh Tasks",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "codexClaudeDevLoop.createTask",
+        "title": "Create Task",
+        "icon": "$(add)"
+      },
+      {
+        "command": "codexClaudeDevLoop.openPlan",
+        "title": "Open PLAN",
+        "icon": "$(book)"
+      },
+      {
+        "command": "codexClaudeDevLoop.openClaudePrompt",
+        "title": "Open Claude Prompt",
+        "icon": "$(file-code)"
+      },
+      {
+        "command": "codexClaudeDevLoop.openCodexPrompt",
+        "title": "Open Codex Prompt",
+        "icon": "$(file-code)"
+      },
+      {
+        "command": "codexClaudeDevLoop.openReport",
+        "title": "Open Implementation Report",
+        "icon": "$(report)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "codexClaudeDevLoop.refreshTasks",
+          "when": "view == codexClaudeDevLoop.tasks",
+          "group": "navigation"
+        },
+        {
+          "command": "codexClaudeDevLoop.createTask",
+          "when": "view == codexClaudeDevLoop.tasks",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "codexClaudeDevLoop.openPlan",
+          "when": "viewItem == taskItem",
+          "group": "inline"
+        },
+        {
+          "command": "codexClaudeDevLoop.openClaudePrompt",
+          "when": "viewItem == taskItem",
+          "group": "inline"
+        },
+        {
+          "command": "codexClaudeDevLoop.openCodexPrompt",
+          "when": "viewItem == taskItem",
+          "group": "inline"
+        },
+        {
+          "command": "codexClaudeDevLoop.openReport",
+          "when": "viewItem == taskItem",
+          "group": "inline"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Codex-Claude Dev Loop",
+      "properties": {
+        "codexClaudeDevLoop.serverUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8765",
+          "description": "URL of the local Codex-Claude Dev Loop server"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile",
+    "test": "node ./out/test/runTest.js"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.6",
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "glob": "^10.3.0",
+    "mocha": "^10.3.0",
+    "typescript": "^5.3.0"
+  }
+}

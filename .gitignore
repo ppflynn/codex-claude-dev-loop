@@ -9,6 +9,10 @@ __pycache__/
 .env
 .env.*
 
+# VS Code extension
+vscode-extension/node_modules/
+vscode-extension/out/
+
 # Auto-generated files
 docs/claude-run.log
 docs/IMPLEMENTATION_REPORT.md
