@@ -51,6 +51,28 @@ class GitToolsTests(unittest.TestCase):
         self.assertTrue(artifacts.diff_stat_path.exists())
         self.assertTrue(artifacts.diff_path.exists())
 
+    def test_collect_includes_untracked_text_files_in_diff_artifact(self):
+        root = self.make_dir()
+        task_dir = self.make_dir() / "task"
+        new_file = root / "vscode-extension" / "src" / "extension.ts"
+        new_file.parent.mkdir(parents=True)
+        new_file.write_text("export function activate() {}\n", encoding="utf-8")
+        responses = [
+            completed([], 0, "true\n"),
+            completed([], 0, "?? vscode-extension/src/extension.ts\n"),
+            completed([], 0, ""),
+            completed([], 0, ""),
+        ]
+        with mock.patch("gui.orchestrator.git_tools._run_git", side_effect=responses):
+            artifacts = git_tools.collect_git_artifacts(root, task_dir, 1)
+
+        diff = artifacts.diff_path.read_text(encoding="utf-8")
+        diff_stat = artifacts.diff_stat_path.read_text(encoding="utf-8")
+        self.assertIn("Untracked files included for review", diff)
+        self.assertIn("diff --git a/vscode-extension/src/extension.ts", diff)
+        self.assertIn("+export function activate() {}", diff)
+        self.assertIn("vscode-extension/src/extension.ts", diff_stat)
+
     def test_env_change_blocks_diff_content(self):
         root = self.make_dir()
         task_dir = self.make_dir() / "task"

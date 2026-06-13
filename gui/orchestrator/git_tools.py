@@ -6,6 +6,9 @@ from pathlib import Path
 
 from .path_safety import path_has_env_segment
 
+MAX_UNTRACKED_DIFF_BYTES = 200_000
+MAX_UNTRACKED_FILE_BYTES = 50_000
+
 
 class GitError(RuntimeError):
     pass
@@ -73,8 +76,82 @@ def _changed_paths_from_status(status: str) -> list[str]:
     return paths
 
 
+def _untracked_paths_from_status(status: str) -> list[str]:
+    paths: list[str] = []
+    for line in status.splitlines():
+        if line.startswith("?? "):
+            path = line[3:].strip()
+            if path:
+                paths.append(path)
+    return paths
+
+
 def status_mentions_env(status: str) -> bool:
     return any(path_has_env_segment(path) for path in _changed_paths_from_status(status))
+
+
+def _is_child_path(parent: Path, child: Path) -> bool:
+    try:
+        child.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+def _untracked_file_diff(project_path: Path, relative_path: str) -> tuple[str, str]:
+    root = project_path.resolve()
+    file_path = (project_path / relative_path).resolve()
+    if not _is_child_path(root, file_path) or not file_path.is_file():
+        return "", f" {relative_path} | skipped\n"
+    try:
+        data = file_path.read_bytes()
+    except OSError as exc:
+        return "", f" {relative_path} | unreadable ({exc})\n"
+    if len(data) > MAX_UNTRACKED_FILE_BYTES:
+        return "", f" {relative_path} | skipped, file exceeds {MAX_UNTRACKED_FILE_BYTES} bytes\n"
+    if b"\0" in data:
+        return "", f" {relative_path} | skipped, binary file\n"
+    text = data.decode("utf-8", errors="replace")
+    escaped_path = relative_path.replace("\\", "/")
+    lines = text.splitlines(keepends=True)
+    if text and not text.endswith(("\n", "\r")):
+        lines[-1] = lines[-1] + "\n"
+    body = "".join("+" + line for line in lines)
+    diff = (
+        f"diff --git a/{escaped_path} b/{escaped_path}\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        f"+++ b/{escaped_path}\n"
+        "@@\n"
+        f"{body}"
+    )
+    line_count = len(lines)
+    stat = f" {escaped_path} | {line_count} {'+' * min(line_count, 80)}\n"
+    return diff, stat
+
+
+def _untracked_files_diff(project_path: Path, status: str) -> tuple[str, str]:
+    snippets: list[str] = []
+    stats: list[str] = []
+    total_bytes = 0
+    for relative_path in _untracked_paths_from_status(status):
+        diff, stat = _untracked_file_diff(project_path, relative_path)
+        stats.append(stat)
+        if not diff:
+            continue
+        encoded_size = len(diff.encode("utf-8", errors="replace"))
+        if total_bytes + encoded_size > MAX_UNTRACKED_DIFF_BYTES:
+            stats.append(f" {relative_path} | skipped, untracked diff budget exceeded\n")
+            continue
+        snippets.append(diff)
+        total_bytes += encoded_size
+    if not snippets and not stats:
+        return "", ""
+    stat_text = "\n# Untracked files included for review\n" + "".join(stats)
+    diff_text = "\n# Untracked files included for review\n" + "\n".join(snippets)
+    if diff_text and not diff_text.endswith("\n"):
+        diff_text += "\n"
+    return diff_text, stat_text
 
 
 def get_git_common_dir(project_path: Path) -> str | None:
@@ -152,8 +229,9 @@ def collect_git_artifacts(project_path: Path, task_dir: Path, round_number: int)
     if diff_result.returncode != 0:
         raise GitError(diff_result.stderr.strip() or "git diff failed.")
 
-    diff_stat = diff_stat_result.stdout
-    diff = diff_result.stdout
+    untracked_diff, untracked_stat = _untracked_files_diff(project_path, status)
+    diff_stat = diff_stat_result.stdout + untracked_stat
+    diff = diff_result.stdout + untracked_diff
     diff_stat_path.write_text(diff_stat, encoding="utf-8")
     diff_path.write_text(diff, encoding="utf-8")
     return GitArtifacts(status_path, diff_stat_path, diff_path, status, diff_stat, diff)
