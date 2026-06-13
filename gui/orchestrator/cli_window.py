@@ -62,11 +62,7 @@ def generate_launcher_script(
     codex_setup = ""
     codex_output_args = ""
     codex_missing_output_check = ""
-    if kind == "codex":
-        codex_home_prefix = f"codex-home-round-{task.round}-"
-        working_dir_setup = "$WorkingDir = $TaskDir"
-        project_key = toml_basic_string(project_path.lower())
-        task_dir_key = toml_basic_string(str(task_dir).lower())
+    if kind in {"claude", "codex"}:
         process_helpers = r"""function ConvertTo-NativeArgument {
   param([AllowEmptyString()][string]$Argument)
   if ($null -eq $Argument) { return '""' }
@@ -102,7 +98,112 @@ function Join-NativeArguments {
   param([string[]]$Arguments)
   return (($Arguments | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' ')
 }
+
+function Write-NativeChunk {
+  param(
+    [AllowEmptyString()][string]$Text,
+    [string]$LogFile,
+    [bool]$IsError
+  )
+  if ($Text.Length -eq 0) { return }
+  [System.IO.File]::AppendAllText($LogFile, $Text, [System.Text.Encoding]::UTF8)
+  if ($IsError) {
+    Write-Host $Text -NoNewline -ForegroundColor Yellow
+  } else {
+    Write-Host $Text -NoNewline
+  }
+}
+
+function Receive-NativeStreamChunk {
+  param(
+    [System.Threading.Tasks.Task[int]]$ReadTask,
+    [byte[]]$Buffer,
+    [System.Text.Decoder]$Decoder,
+    [char[]]$Chars,
+    [string]$LogFile,
+    [bool]$IsError,
+    [ref]$Done,
+    [ref]$NextTask,
+    [System.IO.Stream]$Stream
+  )
+  if ($Done.Value -or -not $ReadTask.IsCompleted) { return }
+  $Count = $ReadTask.Result
+  if ($Count -le 0) {
+    $CharCount = $Decoder.GetChars($Buffer, 0, 0, $Chars, 0, $true)
+    if ($CharCount -gt 0) {
+      $Text = -join $Chars[0..($CharCount - 1)]
+      Write-NativeChunk -Text $Text -LogFile $LogFile -IsError $IsError
+    }
+    $Done.Value = $true
+    return
+  }
+  $CharCount = $Decoder.GetChars($Buffer, 0, $Count, $Chars, 0, $false)
+  if ($CharCount -gt 0) {
+    $Text = -join $Chars[0..($CharCount - 1)]
+    Write-NativeChunk -Text $Text -LogFile $LogFile -IsError $IsError
+  }
+  $NextTask.Value = $Stream.ReadAsync($Buffer, 0, $Buffer.Length)
+}
+
+function Invoke-StreamingNativeProcess {
+  param(
+    [string]$CommandName,
+    [string[]]$Arguments,
+    [string]$WorkingDirectory,
+    [string]$PromptText,
+    [string]$LogFile,
+    [string]$Label
+  )
+  $CommandInfo = Get-Command $CommandName -ErrorAction Stop
+  $Executable = $CommandInfo.Source
+  if (-not $Executable) { $Executable = $CommandInfo.Path }
+  $ProcessInfo = [System.Diagnostics.ProcessStartInfo]::new()
+  $ProcessInfo.FileName = $Executable
+  $ProcessInfo.Arguments = Join-NativeArguments $Arguments
+  $ProcessInfo.WorkingDirectory = $WorkingDirectory
+  $ProcessInfo.UseShellExecute = $false
+  $ProcessInfo.RedirectStandardInput = $true
+  $ProcessInfo.RedirectStandardOutput = $true
+  $ProcessInfo.RedirectStandardError = $true
+  $ProcessInfo.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+  $ProcessInfo.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+  $ProcessInfo.CreateNoWindow = $true
+  $Process = [System.Diagnostics.Process]::new()
+  $Process.StartInfo = $ProcessInfo
+  Add-Content -LiteralPath $LogFile -Value ("{0} command: {1}" -f $Label, $Executable) -Encoding UTF8
+  [void]$Process.Start()
+
+  $StdoutBuffer = [byte[]]::new(4096)
+  $StderrBuffer = [byte[]]::new(4096)
+  $StdoutChars = [char[]]::new(4096)
+  $StderrChars = [char[]]::new(4096)
+  $StdoutDecoder = [System.Text.Encoding]::UTF8.GetDecoder()
+  $StderrDecoder = [System.Text.Encoding]::UTF8.GetDecoder()
+  $StdoutTask = $Process.StandardOutput.BaseStream.ReadAsync($StdoutBuffer, 0, $StdoutBuffer.Length)
+  $StderrTask = $Process.StandardError.BaseStream.ReadAsync($StderrBuffer, 0, $StderrBuffer.Length)
+  $StdoutDone = $false
+  $StderrDone = $false
+
+  $PromptBytes = [System.Text.Encoding]::UTF8.GetBytes($PromptText)
+  $Process.StandardInput.BaseStream.Write($PromptBytes, 0, $PromptBytes.Length)
+  $Process.StandardInput.Close()
+
+  while (-not ($StdoutDone -and $StderrDone)) {
+    Receive-NativeStreamChunk -ReadTask $StdoutTask -Buffer $StdoutBuffer -Decoder $StdoutDecoder -Chars $StdoutChars -LogFile $LogFile -IsError $false -Done ([ref]$StdoutDone) -NextTask ([ref]$StdoutTask) -Stream $Process.StandardOutput.BaseStream
+    Receive-NativeStreamChunk -ReadTask $StderrTask -Buffer $StderrBuffer -Decoder $StderrDecoder -Chars $StderrChars -LogFile $LogFile -IsError $true -Done ([ref]$StderrDone) -NextTask ([ref]$StderrTask) -Stream $Process.StandardError.BaseStream
+    if (-not ($StdoutDone -and $StderrDone)) {
+      Start-Sleep -Milliseconds 50
+    }
+  }
+  $Process.WaitForExit()
+  return $Process.ExitCode
+}
 """
+    if kind == "codex":
+        codex_home_prefix = f"codex-home-round-{task.round}-"
+        working_dir_setup = "$WorkingDir = $TaskDir"
+        project_key = toml_basic_string(project_path.lower())
+        task_dir_key = toml_basic_string(str(task_dir).lower())
         codex_setup = f"""$CodexHome = Join-Path $TaskDir ('{escape_ps(codex_home_prefix)}' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Force -Path $CodexHome | Out-Null
 $DefaultCodexHome = Join-Path $env:USERPROFILE '.codex'
@@ -195,58 +296,45 @@ if (-not (Get-Command $CommandName -ErrorAction SilentlyContinue)) {{
 }}
 try {{
   $PromptText = Get-Content -Raw -LiteralPath $PromptFile -Encoding UTF8
-  if ($Command.Count -gt 1) {{
-    $CliArgs = @($Command[1..($Command.Count - 1)])
-    & $CommandName @CliArgs
+  if ($LauncherKind -eq 'claude') {{
+    $ClaudeArgs = @()
+    if ($Command.Count -gt 1) {{
+      $ClaudeArgs += @($Command[1..($Command.Count - 1)])
+    }}
+    $HasPrintMode = $false
+    $HasPermissionMode = $false
+    foreach ($ClaudeArg in $ClaudeArgs) {{
+      if ($ClaudeArg -eq '-p' -or $ClaudeArg -eq '--print') {{
+        $HasPrintMode = $true
+      }}
+      if ($ClaudeArg -eq '--permission-mode' -or $ClaudeArg -like '--permission-mode=*') {{
+        $HasPermissionMode = $true
+      }}
+    }}
+    if (-not $HasPrintMode) {{
+      $ClaudeArgs += '-p'
+    }}
+    if (-not $HasPermissionMode) {{
+      $ClaudeArgs += @('--permission-mode', 'bypassPermissions')
+    }}
+    Add-Content -LiteralPath $LogFile -Value ("Claude args: {{0}}" -f ($ClaudeArgs -join ' ')) -Encoding UTF8
+    Write-Host 'Claude is running. Output will appear below.'
+    $Code = Invoke-StreamingNativeProcess -CommandName $CommandName -Arguments $ClaudeArgs -WorkingDirectory $WorkingDir -PromptText $PromptText -LogFile $LogFile -Label 'Claude'
   }} elseif ($LauncherKind -eq 'codex') {{
     $CodexArgs = @('exec', '--ephemeral', '--skip-git-repo-check', '--sandbox', 'workspace-write', '-C', $TaskDir)
     {codex_output_args}
     $CodexArgs += @('--color', 'never')
     $CodexArgs += '-'
     Add-Content -LiteralPath $LogFile -Value ("Codex args: {{0}}" -f ($CodexArgs -join ' ')) -Encoding UTF8
-    $CodexCommandInfo = Get-Command $CommandName -ErrorAction Stop
-    $CodexExecutable = $CodexCommandInfo.Source
-    if (-not $CodexExecutable) {{ $CodexExecutable = $CodexCommandInfo.Path }}
-    $CodexProcessInfo = [System.Diagnostics.ProcessStartInfo]::new()
-    $CodexProcessInfo.FileName = $CodexExecutable
-    $CodexProcessInfo.Arguments = Join-NativeArguments $CodexArgs
-    $CodexProcessInfo.WorkingDirectory = $WorkingDir
-    $CodexProcessInfo.UseShellExecute = $false
-    $CodexProcessInfo.RedirectStandardInput = $true
-    $CodexProcessInfo.RedirectStandardOutput = $true
-    $CodexProcessInfo.RedirectStandardError = $true
-    $CodexProcessInfo.StandardOutputEncoding = [System.Text.Encoding]::UTF8
-    $CodexProcessInfo.StandardErrorEncoding = [System.Text.Encoding]::UTF8
-    $CodexProcessInfo.CreateNoWindow = $true
-    $CodexProcess = [System.Diagnostics.Process]::new()
-    $CodexProcess.StartInfo = $CodexProcessInfo
-    Write-Host 'Codex is running. Captured output will appear when it finishes.'
-    [void]$CodexProcess.Start()
-    $StdoutTask = $CodexProcess.StandardOutput.ReadToEndAsync()
-    $StderrTask = $CodexProcess.StandardError.ReadToEndAsync()
-    $PromptBytes = [System.Text.Encoding]::UTF8.GetBytes($PromptText)
-    $CodexProcess.StandardInput.BaseStream.Write($PromptBytes, 0, $PromptBytes.Length)
-    $CodexProcess.StandardInput.Close()
-    $CodexProcess.WaitForExit()
-    $Stdout = $StdoutTask.Result
-    $Stderr = $StderrTask.Result
-    $Code = $CodexProcess.ExitCode
-    if ($Stdout) {{
-      Add-Content -LiteralPath $LogFile -Value $Stdout -Encoding UTF8
-      Write-Host $Stdout
-    }}
-    if ($Stderr) {{
-      Add-Content -LiteralPath $LogFile -Value "Codex stderr:" -Encoding UTF8
-      Add-Content -LiteralPath $LogFile -Value $Stderr -Encoding UTF8
-      if ($Code -ne 0) {{
-        Write-Host $Stderr -ForegroundColor Yellow
-      }} else {{
-        Write-Host 'Codex emitted non-fatal stderr warnings; they were saved to the log.' -ForegroundColor DarkYellow
-      }}
-    }}
+    Write-Host 'Codex is running. Output will appear below.'
+    $Code = Invoke-StreamingNativeProcess -CommandName $CommandName -Arguments $CodexArgs -WorkingDirectory $WorkingDir -PromptText $PromptText -LogFile $LogFile -Label 'Codex'
 {codex_missing_output_check}
   }} else {{
-    & $CommandName $PromptText
+    $CliArgs = @()
+    if ($Command.Count -gt 1) {{
+      $CliArgs = @($Command[1..($Command.Count - 1)])
+    }}
+    & $CommandName @CliArgs
     $Code = $LASTEXITCODE
   }}
   Add-Content -LiteralPath $LogFile -Value ("CLI exit code: {{0}}" -f $Code) -Encoding UTF8

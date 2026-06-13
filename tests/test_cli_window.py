@@ -47,6 +47,36 @@ class CliWindowTests(unittest.TestCase):
         self.assertIn("Removed unsupported SOCKS proxy env for Claude", content)
         self.assertIn("[Environment]::SetEnvironmentVariable($ProxyVariable, $null, 'Process')", content)
         self.assertIn("socks[45]", content)
+        self.assertIn("Claude args:", content)
+        self.assertIn("$ClaudeArgs += '-p'", content)
+        self.assertIn("$ClaudeArgs += @('--permission-mode', 'bypassPermissions')", content)
+        self.assertIn("Write-NativeChunk", content)
+        self.assertIn("Receive-NativeStreamChunk", content)
+        self.assertIn("Invoke-StreamingNativeProcess", content)
+        self.assertIn("Write-Host $Text -NoNewline", content)
+        self.assertIn("Claude is running. Output will appear below.", content)
+        self.assertIn("-Arguments $ClaudeArgs", content)
+        self.assertIn("[System.Text.Encoding]::UTF8.GetBytes($PromptText)", content)
+        self.assertIn("StandardInput.BaseStream.Write", content)
+        self.assertIn("BaseStream.ReadAsync", content)
+        self.assertNotIn("ReadToEndAsync()", content)
+        self.assertNotIn("& $CommandName $PromptText", content)
+
+    def test_generate_claude_launcher_preserves_configured_args(self):
+        script = generate_launcher_script(
+            task=self.task,
+            task_dir=self.task_dir,
+            kind="claude",
+            command=["claude", "--model", "sonnet"],
+            prompt_path=self.prompt,
+        )
+        content = script.read_text(encoding="utf-8")
+        self.assertIn('"--model", "sonnet"', content)
+        self.assertIn("$ClaudeArgs += @($Command[1..($Command.Count - 1)])", content)
+        self.assertIn("if (-not $HasPrintMode)", content)
+        self.assertIn("if (-not $HasPermissionMode)", content)
+        self.assertIn("$ProcessInfo.Arguments = Join-NativeArguments $Arguments", content)
+        self.assertIn("-Arguments $ClaudeArgs", content)
 
     def test_generate_codex_launcher_mentions_output_file(self):
         output = self.task_dir / "CODEX_REVIEW.json"
@@ -88,12 +118,15 @@ class CliWindowTests(unittest.TestCase):
         self.assertNotIn("--version", content)
         self.assertIn("System.Diagnostics.ProcessStartInfo", content)
         self.assertIn("RedirectStandardError = $true", content)
-        self.assertIn("ReadToEndAsync()", content)
+        self.assertIn("Invoke-StreamingNativeProcess", content)
+        self.assertIn("Codex is running. Output will appear below.", content)
+        self.assertIn("-Arguments $CodexArgs", content)
+        self.assertIn("BaseStream.ReadAsync", content)
+        self.assertNotIn("ReadToEndAsync()", content)
         self.assertIn("[System.Text.Encoding]::UTF8.GetBytes($PromptText)", content)
         self.assertIn("StandardInput.BaseStream.Write", content)
         self.assertNotIn("StandardInput.Write($PromptText)", content)
-        self.assertIn("Join-NativeArguments $CodexArgs", content)
-        self.assertIn("Codex emitted non-fatal stderr warnings", content)
+        self.assertIn("$ProcessInfo.Arguments = Join-NativeArguments $Arguments", content)
         self.assertNotIn("Tee-Object", content)
         self.assertNotIn("2>&1", content)
         self.assertIn("Codex completed without creating the expected output file", content)
