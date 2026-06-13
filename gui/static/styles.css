@@ -487,6 +487,43 @@ textarea:focus {
   color: var(--danger);
 }
 
+.pill-group {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.kind-pill.wt-primary {
+  background: #d4eaf7;
+  color: #1a5f8a;
+}
+
+.kind-pill.wt-worktree {
+  background: #f0e6f6;
+  color: #6b3f8a;
+}
+
+.kind-pill.kind-pill-warn {
+  background: #fff3dc;
+  color: var(--warning);
+}
+
+.project-item.project-unavailable {
+  border-color: var(--warning);
+  background: #fffbf0;
+}
+
+.project-item.project-unavailable .kind-pill.kind-pill-warn {
+  background: var(--warning);
+  color: #fff;
+}
+
+.path-unavailable {
+  color: var(--warning) !important;
+  font-weight: 650;
+}
+
 .run-status dl {
   display: grid;
   gap: 8px;
