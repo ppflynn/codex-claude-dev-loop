@@ -84,12 +84,24 @@ function renderProjects() {
   state.projects.forEach((project) => {
     const button = document.createElement("button");
     button.type = "button";
-    button.className = `project-item ${project.id === state.selectedProjectId ? "active" : ""}`;
+    const isAvailable = project.available !== false;
+    const cls = ["project-item"];
+    if (project.id === state.selectedProjectId) cls.push("active");
+    if (!isAvailable) cls.push("project-unavailable");
+    button.className = cls.join(" ");
     button.onclick = () => selectProject(project.id);
 
     const title = document.createElement("div");
     title.className = "project-title";
-    title.innerHTML = `<span>${escapeHtml(project.name)}</span><span class="kind-pill">${kindLabel(project.kind)}</span>`;
+    let badges = `<span class="kind-pill">${kindLabel(project.kind)}</span>`;
+    const wtLabel = worktreeTypeLabel(project.worktreeType);
+    if (wtLabel) {
+      badges += `<span class="kind-pill ${worktreeTypeClass(project.worktreeType)}">${wtLabel}</span>`;
+    }
+    if (!isAvailable) {
+      badges += `<span class="kind-pill kind-pill-warn">不可用</span>`;
+    }
+    title.innerHTML = `<span>${escapeHtml(project.name)}</span><span class="pill-group">${badges}</span>`;
 
     const path = document.createElement("div");
     path.className = "project-path";
@@ -97,7 +109,13 @@ function renderProjects() {
 
     const meta = document.createElement("div");
     meta.className = "project-meta";
-    meta.textContent = project.lastResult ? `上次：${project.lastResult}` : "可创建本地任务";
+    const parts = [];
+    if (project.branch) parts.push(`分支：${project.branch}`);
+    if (project.worktreeType === "worktree" && project.mainWorktreePath) {
+      parts.push(`父项目：${project.mainWorktreePath}`);
+    }
+    if (project.lastResult) parts.push(`上次：${project.lastResult}`);
+    meta.textContent = parts.length ? parts.join("  ·  ") : "可创建本地任务";
 
     button.append(title, path, meta);
     list.appendChild(button);
@@ -116,8 +134,31 @@ async function selectProject(id) {
 async function loadSelectedProject() {
   const project = selectedProject();
   $("project-name").textContent = project ? project.name : "未选择项目";
-  $("project-path-label").textContent = project ? `${project.path} / ${kindLabel(project.kind)}` : "先导入或选择一个项目。";
-  $("plan-editor").disabled = !project;
+
+  let pathLabel = "先导入或选择一个项目。";
+  if (project) {
+    const parts = [`${project.path}`];
+    const wtLabel = worktreeTypeLabel(project.worktreeType);
+    if (wtLabel) parts.push(wtLabel);
+    parts.push(kindLabel(project.kind));
+    if (project.branch) parts.push(`分支：${project.branch}`);
+    if (project.worktreeType === "worktree" && project.mainWorktreePath) {
+      parts.push(`父：${project.mainWorktreePath}`);
+    }
+    if (project.available === false) {
+      parts.push("⚠ 路径不存在");
+    }
+    pathLabel = parts.join("  ·  ");
+  }
+  $("project-path-label").textContent = pathLabel;
+
+  if (project && project.available === false) {
+    $("project-path-label").classList.add("path-unavailable");
+  } else {
+    $("project-path-label").classList.remove("path-unavailable");
+  }
+
+  $("plan-editor").disabled = !project || project.available === false;
   updateActionStates();
 
   if (!project) {
@@ -247,6 +288,7 @@ function renderTaskDetails() {
   $("task-state").className = `status-pill ${statusClass(status)}`;
   $("task-title-label").textContent = task?.title || "-";
   $("task-id-label").textContent = task?.id || "-";
+  $("task-path-label").textContent = task?.projectPath || "-";
   $("task-round").textContent = task ? `${task.round}` : "-";
   $("task-max-rounds").textContent = task ? `${task.maxRounds}` : "-";
   $("task-created").textContent = task?.createdAt || "-";
@@ -310,10 +352,11 @@ function updateActionStates() {
   const isArchiveView = state.taskView === "archived";
   const isTrashView = state.taskView === "trash";
 
-  $("initialize-button").disabled = !project || project.kind !== "git-uninitialized";
-  $("save-plan-button").disabled = !project;
+  const projectAvailable = project && project.available !== false;
+  $("initialize-button").disabled = !projectAvailable || project.kind !== "git-uninitialized";
+  $("save-plan-button").disabled = !projectAvailable;
   $("remove-project-button").disabled = !project;
-  $("create-task-button").disabled = !project || !isActiveView;
+  $("create-task-button").disabled = !projectAvailable || !isActiveView;
   $("launch-claude-button").disabled = !task || !isActiveView || status !== "WAITING_FOR_CLAUDE";
   $("claude-completed-button").disabled = !task || !isActiveView || status !== "CLAUDE_WINDOW_STARTED";
   $("launch-codex-button").disabled = !task || !isActiveView || status !== "WAITING_FOR_CODEX";
@@ -366,7 +409,15 @@ async function initializeProject() {
 async function removeProject() {
   const project = selectedProject();
   if (!project) return;
-  const message = `只从工具中移除，不删除本地文件。\n\n项目：${project.name}\n路径：${project.path}\n\n确认移除这个项目记录吗？`;
+  const wtLabel = worktreeTypeLabel(project.worktreeType);
+  let message = "只从工具中移除，不删除本地文件。";
+  if (wtLabel) {
+    message += "\n\n此操作只从工具中移除工作区记录，不会删除本地目录或Git分支。";
+  }
+  message += `\n\n项目：${project.name}\n路径：${project.path}`;
+  if (wtLabel) message += `\n类型：${wtLabel}`;
+  if (project.branch) message += `\n分支：${project.branch}`;
+  message += "\n\n确认移除这个项目记录吗？";
   if (!window.confirm(message)) return;
   try {
     await api(`/api/projects/${project.id}`, { method: "DELETE" });
@@ -502,6 +553,18 @@ function kindLabel(kind) {
   if (kind === "orchestrator") return "协同项目";
   if (kind === "git-uninitialized") return "Git 仓库";
   return kind || "未知";
+}
+
+function worktreeTypeLabel(worktreeType) {
+  if (worktreeType === "primary") return "主工作区";
+  if (worktreeType === "worktree") return "Worktree";
+  return null;
+}
+
+function worktreeTypeClass(worktreeType) {
+  if (worktreeType === "primary") return "wt-primary";
+  if (worktreeType === "worktree") return "wt-worktree";
+  return "";
 }
 
 function escapeHtml(value) {

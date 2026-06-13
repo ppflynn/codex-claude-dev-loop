@@ -77,6 +77,59 @@ def status_mentions_env(status: str) -> bool:
     return any(path_has_env_segment(path) for path in _changed_paths_from_status(status))
 
 
+def get_git_common_dir(project_path: Path) -> str | None:
+    result = _run_git(project_path, ["rev-parse", "--git-common-dir"])
+    if result.returncode != 0:
+        return None
+    common_dir = result.stdout.strip()
+    if not common_dir:
+        return None
+    if Path(common_dir).is_absolute():
+        return str(Path(common_dir).resolve())
+    return str((project_path / common_dir).resolve())
+
+
+def get_current_branch(project_path: Path) -> str | None:
+    result = _run_git(project_path, ["rev-parse", "--abbrev-ref", "HEAD"])
+    if result.returncode != 0:
+        return None
+    branch = result.stdout.strip()
+    if not branch or branch == "HEAD":
+        return None
+    return branch
+
+
+def is_git_worktree(project_path: Path) -> bool:
+    git_path = project_path / ".git"
+    if git_path.is_file():
+        return True
+    if git_path.is_dir():
+        common = get_git_common_dir(project_path)
+        local_git = str(git_path.resolve())
+        if common and Path(common).resolve() != Path(local_git):
+            return True
+    return False
+
+
+def get_main_worktree_path(project_path: Path) -> str | None:
+    result = _run_git(project_path, ["worktree", "list", "--porcelain"])
+    if result.returncode != 0:
+        return None
+    main_path: str | None = None
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            candidate = line[len("worktree "):]
+            if main_path is None:
+                main_path = candidate
+            elif candidate != str(project_path):
+                pass
+        if line.strip() == "bare":
+            pass
+    if main_path and Path(main_path) != project_path.resolve():
+        return main_path
+    return None
+
+
 def collect_git_artifacts(project_path: Path, task_dir: Path, round_number: int) -> GitArtifacts:
     assert_git_work_tree(project_path)
     status = git_status(project_path)

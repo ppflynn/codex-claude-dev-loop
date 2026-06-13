@@ -30,6 +30,10 @@ from gui.orchestrator.git_tools import (
     assert_clean_work_tree,
     assert_git_work_tree,
     collect_git_artifacts,
+    get_current_branch,
+    get_git_common_dir,
+    get_main_worktree_path,
+    is_git_worktree,
 )
 from gui.orchestrator.prompts import (
     write_claude_implementation_prompt,
@@ -145,15 +149,32 @@ def is_inside_git_repo(path: Path) -> bool:
 
 def make_project(path: Path, name: str | None = None) -> dict[str, Any]:
     kind = detect_project_kind(path)
-    return {
+    project: dict[str, Any] = {
         "id": project_id(path),
         "name": name.strip() if name and name.strip() else path.name,
         "path": str(path),
         "kind": kind,
+        "worktreeType": None,
+        "gitCommonDir": None,
+        "branch": None,
+        "mainWorktreePath": None,
+        "available": True,
         "lastResult": None,
         "lastExitCode": None,
         "lastRunAt": None,
     }
+    if kind in ("orchestrator", "git-uninitialized"):
+        try:
+            project["gitCommonDir"] = get_git_common_dir(path)
+            project["branch"] = get_current_branch(path)
+            if is_git_worktree(path):
+                project["worktreeType"] = "worktree"
+                project["mainWorktreePath"] = get_main_worktree_path(path)
+            else:
+                project["worktreeType"] = "primary"
+        except Exception:
+            pass
+    return project
 
 
 def clamp_max_rounds(value: Any) -> int:
@@ -215,26 +236,85 @@ class ProjectStore:
             projects = data.get("projects", [])
             if not isinstance(projects, list):
                 return []
+            changed = False
+            for project in projects:
+                project_path = project.get("path", "")
+                if project_path:
+                    is_dir = Path(project_path).is_dir()
+                    project["available"] = is_dir
+                    if is_dir:
+                        changed = self._refresh_project_metadata(project) or changed
+                else:
+                    project["available"] = False
+            if changed:
+                write_json_file(self.path, {"projects": projects})
             return projects
 
     def save_projects(self, projects: list[dict[str, Any]]) -> None:
         with self._lock:
             write_json_file(self.path, {"projects": projects})
 
+    @staticmethod
+    def _same_path(a: str, b: str) -> bool:
+        na = a.strip().lower().replace("\\", "/").rstrip("/")
+        nb = b.strip().lower().replace("\\", "/").rstrip("/")
+        return na == nb
+
+    @staticmethod
+    def _refresh_project_metadata(project: dict[str, Any]) -> bool:
+        """Refresh worktree metadata for an available project. Returns True if anything changed."""
+        project_path = project.get("path", "")
+        if not project_path:
+            return False
+        path = Path(project_path)
+        kind = project.get("kind")
+        if kind not in ("orchestrator", "git-uninitialized"):
+            return False
+        changed = False
+        try:
+            common_dir = get_git_common_dir(path)
+            if project.get("gitCommonDir") != common_dir:
+                project["gitCommonDir"] = common_dir
+                changed = True
+            branch = get_current_branch(path)
+            if project.get("branch") != branch:
+                project["branch"] = branch
+                changed = True
+            if is_git_worktree(path):
+                if project.get("worktreeType") != "worktree":
+                    project["worktreeType"] = "worktree"
+                    changed = True
+                main_path = get_main_worktree_path(path)
+                if project.get("mainWorktreePath") != main_path:
+                    project["mainWorktreePath"] = main_path
+                    changed = True
+            else:
+                if project.get("worktreeType") != "primary":
+                    project["worktreeType"] = "primary"
+                    changed = True
+        except Exception:
+            pass
+        return changed
+
     def add_project(self, path: Path, name: str | None = None) -> dict[str, Any]:
         project = make_project(path, name)
         projects = self.list_projects()
-        existing = next((p for p in projects if p.get("id") == project["id"]), None)
-        if existing:
-            existing.update(
-                {
-                    "name": project["name"],
-                    "path": project["path"],
-                    "kind": project["kind"],
-                }
-            )
-            self.save_projects(projects)
-            return existing
+        for existing in projects:
+            if self._same_path(str(path), str(existing.get("path", ""))):
+                existing.update(
+                    {
+                        "name": project["name"],
+                        "path": project["path"],
+                        "kind": project["kind"],
+                        "worktreeType": project.get("worktreeType"),
+                        "gitCommonDir": project.get("gitCommonDir"),
+                        "branch": project.get("branch"),
+                        "mainWorktreePath": project.get("mainWorktreePath"),
+                        "available": True,
+                    }
+                )
+                self.save_projects(projects)
+                return existing
         projects.append(project)
         self.save_projects(projects)
         return project
@@ -459,6 +539,7 @@ def initialize_project(project: dict[str, Any], store: ProjectStore) -> dict[str
 
 
 def read_plan(project: dict[str, Any]) -> dict[str, Any]:
+    _validate_project_available(project)
     path = Path(project["path"]) / "docs" / "PLAN.md"
     if not path.exists():
         return {"exists": False, "content": ""}
@@ -466,6 +547,7 @@ def read_plan(project: dict[str, Any]) -> dict[str, Any]:
 
 
 def write_plan(project: dict[str, Any], content: str) -> dict[str, Any]:
+    _validate_project_available(project)
     path = Path(project["path"]) / "docs" / "PLAN.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
@@ -473,6 +555,7 @@ def write_plan(project: dict[str, Any], content: str) -> dict[str, Any]:
 
 
 def read_artifacts(project: dict[str, Any]) -> dict[str, Any]:
+    _validate_project_available(project)
     project_path = Path(project["path"])
     artifacts: dict[str, Any] = {}
     for key, relative in ARTIFACTS.items():
@@ -483,6 +566,15 @@ def read_artifacts(project: dict[str, Any]) -> dict[str, Any]:
             "content": path.read_text(encoding="utf-8", errors="replace") if path.exists() else "",
         }
     return artifacts
+
+
+def _validate_project_available(project: dict[str, Any]) -> Path:
+    if project.get("available") is False:
+        raise ApiError(
+            HTTPStatus.CONFLICT,
+            f"Project path is no longer available: {project.get('path', 'unknown')}",
+        )
+    return resolve_whitelisted_project(project)
 
 
 def resolve_whitelisted_project(project: dict[str, Any]) -> Path:
@@ -505,8 +597,20 @@ def set_task_status(task, target: str, message: str) -> None:
 
 def validate_task_project(task, project_store: ProjectStore) -> Path:
     project = project_store.get_project(task.projectId)
-    project_path = resolve_whitelisted_project(project)
-    task_path = Path(task.projectPath).expanduser().resolve(strict=True)
+    try:
+        project_path = resolve_whitelisted_project(project)
+    except ApiError as exc:
+        raise ApiError(
+            HTTPStatus.CONFLICT,
+            f"Target worktree path is no longer available: {project.get('path', 'unknown')}. {exc.message}",
+        ) from exc
+    try:
+        task_path = Path(task.projectPath).expanduser().resolve(strict=True)
+    except FileNotFoundError:
+        raise ApiError(
+            HTTPStatus.CONFLICT,
+            f"Task project path no longer exists: {task.projectPath}",
+        )
     if task_path != project_path:
         raise ApiError(HTTPStatus.BAD_REQUEST, "Task project path no longer matches the project whitelist.")
     return project_path
@@ -514,7 +618,21 @@ def validate_task_project(task, project_store: ProjectStore) -> Path:
 
 def create_task(body: dict[str, Any], project_store: ProjectStore, task_store: TaskStore):
     project = project_store.get_project(str(body.get("projectId", "")))
-    project_path = resolve_whitelisted_project(project)
+    try:
+        project_path = resolve_whitelisted_project(project)
+    except ApiError as exc:
+        task = task_store.create(
+            project_id=str(project["id"]),
+            project_path=str(project.get("path", "")),
+            title=str(body.get("title") or ""),
+            description=str(body.get("description") or ""),
+            acceptance=str(body.get("acceptance") or ""),
+            test_command=str(body.get("testCommand") or ""),
+            max_rounds=clamp_max_rounds(body.get("maxRounds", 3)),
+        )
+        task.set_status(Status.BLOCKED, f"Target worktree path does not exist: {exc.message}")
+        task_store.save(task)
+        return task
     assert_clean_work_tree(project_path)
     task = task_store.create(
         project_id=str(project["id"]),
@@ -721,12 +839,17 @@ def remove_project(project_id_value: str, project_store: ProjectStore, task_stor
     project = project_store.get_project(project_id_value)
     if runs.is_project_running(project_id_value) or project_has_running_tasks(project_id_value, task_store):
         raise ApiError(HTTPStatus.CONFLICT, "Project has running tasks and cannot be removed.")
+    worktree_type = project.get("worktreeType")
     removed = project_store.remove_project(project_id_value)
-    write_audit_log(
-        "project.remove",
-        project_id_value,
-        {"name": removed.get("name"), "path": removed.get("path"), "localFilesDeleted": False},
-    )
+    audit_details = {
+        "name": removed.get("name"),
+        "path": removed.get("path"),
+        "localFilesDeleted": False,
+        "worktreeType": worktree_type,
+    }
+    if worktree_type:
+        audit_details["note"] = "Worktree record removed; local directory and Git branch were NOT deleted."
+    write_audit_log("project.remove", project_id_value, audit_details)
     return project
 
 
