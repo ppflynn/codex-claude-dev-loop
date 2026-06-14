@@ -42,6 +42,251 @@ const stageLabels = {
 const terminalStatuses = new Set(["PASS", "BLOCKED", "FAILED", "CANCELLED"]);
 const runningTaskStatuses = new Set(["CLAUDE_WINDOW_STARTED", "CODEX_WINDOW_STARTED"]);
 
+const terminalConnections = {
+  claude: { source: null, done: false, subKey: null, reconnectTimer: null, reconnectDelay: 1000 },
+  codex: { source: null, done: false, subKey: null, reconnectTimer: null, reconnectDelay: 1000 },
+};
+
+function connectTerminal(client) {
+  disconnectTerminal(client);
+  const task = selectedTask();
+  if (!task) return;
+
+  const taskId = task.id;
+  const taskRound = task.round;
+
+  const outputEl = document.getElementById(`${client}-output`);
+  if (!outputEl) return;
+  outputEl.textContent = "正在连接...";
+  terminalConnections[client].done = false;
+  terminalConnections[client].hasOutput = false;
+  updateTerminalBadges();
+
+  const es = new EventSource(`/api/tasks/${taskId}/terminal/${client}/stream`);
+  terminalConnections[client].source = es;
+
+  es.onmessage = (event) => {
+    const current = selectedTask();
+    if (!current || current.id !== taskId || current.round !== taskRound) {
+      es.close();
+      if (terminalConnections[client].source === es) terminalConnections[client].source = null;
+      return;
+    }
+    try {
+      const data = JSON.parse(event.data);
+      if (data.waiting) {
+        if (!terminalConnections[client].hasOutput) {
+          outputEl.textContent = "等待 CLI 启动并创建日志文件...";
+        }
+      }
+      if (data.chunk) {
+        terminalConnections[client].reconnectDelay = 1000;
+        if (!terminalConnections[client].hasOutput) {
+          outputEl.textContent = data.chunk;
+          terminalConnections[client].hasOutput = true;
+        } else {
+          outputEl.textContent += data.chunk;
+        }
+        outputEl.scrollTop = outputEl.scrollHeight;
+      }
+      if (data.done) {
+        if (terminalConnections[client].source === es) {
+          terminalConnections[client].done = true;
+          es.close();
+          terminalConnections[client].source = null;
+        }
+        updateTerminalBadges();
+      }
+    } catch (_e) {
+      // ignore parse errors
+    }
+  };
+
+  es.onerror = () => {
+    es.close();
+    const wasCurrent = terminalConnections[client].source === es;
+    if (wasCurrent) {
+      terminalConnections[client].source = null;
+      terminalConnections[client].subKey = null;
+    }
+    updateTerminalBadges();
+
+    if (!wasCurrent) return;
+
+    const current = selectedTask();
+    const activeForClient =
+      (client === "claude" && (current?.activeClient === "claude" || current?.status === "CLAUDE_WINDOW_STARTED")) ||
+      (client === "codex" && (current?.activeClient === "codex" || current?.status === "CODEX_WINDOW_STARTED"));
+    if (current && current.id === taskId && current.round === taskRound
+        && runningTaskStatuses.has(current.status) && activeForClient) {
+      const delay = terminalConnections[client].reconnectDelay;
+      terminalConnections[client].reconnectTimer = setTimeout(() => {
+        terminalConnections[client].reconnectTimer = null;
+        if (selectedTask()?.id === taskId && selectedTask()?.round === taskRound) {
+          terminalConnections[client].reconnectDelay = Math.min(delay * 2, 30000);
+          connectTerminal(client);
+        }
+      }, delay);
+    }
+  };
+}
+
+function disconnectTerminal(client) {
+  const conn = terminalConnections[client];
+  if (conn.reconnectTimer) {
+    clearTimeout(conn.reconnectTimer);
+    conn.reconnectTimer = null;
+  }
+  if (conn.source) {
+    conn.source.close();
+    conn.source = null;
+  }
+  conn.done = false;
+}
+
+function disconnectAllTerminals() {
+  disconnectTerminal("claude");
+  disconnectTerminal("codex");
+  updateTerminalBadges();
+}
+
+function updateTerminalBadges() {
+  const task = selectedTask();
+  const state = document.getElementById("terminal-state");
+  if (!state) return;
+
+  if (!task) {
+    state.textContent = "待选择";
+    state.className = "status-pill";
+    return;
+  }
+
+  updateClientTitleBadge("claude", task);
+  updateClientTitleBadge("codex", task);
+
+  const hasClaude = terminalConnections.claude.source !== null;
+  const hasCodex = terminalConnections.codex.source !== null;
+  if (hasClaude || hasCodex) {
+    const labels = [];
+    if (hasClaude) labels.push("Claude 连接中");
+    if (hasCodex) labels.push("Codex 连接中");
+    state.textContent = labels.join(" / ");
+    state.className = "status-pill running";
+  } else if (terminalConnections.claude.done || terminalConnections.codex.done) {
+    state.textContent = "已完成";
+    state.className = "status-pill pass";
+  } else if (task.activeClient && runningTaskStatuses.has(task.status)) {
+    state.textContent = "等待输出";
+    state.className = "status-pill running";
+  } else {
+    state.textContent = "待命中";
+    state.className = "status-pill";
+  }
+}
+
+function updateClientTitleBadge(client, task) {
+  const box = document.getElementById(`${client}-terminal-box`);
+  if (!box) return;
+  const title = box.querySelector(".terminal-title");
+  if (!title) return;
+
+  let badge = title.querySelector(".terminal-client-badge");
+  if (!badge) {
+    badge = document.createElement("span");
+    badge.className = "terminal-client-badge";
+    title.appendChild(badge);
+  }
+
+  const isActive = task.activeClient === client && runningTaskStatuses.has(task.status);
+  const isConnected = terminalConnections[client].source !== null;
+  const isDone = terminalConnections[client].done;
+
+  if (isConnected) {
+    badge.textContent = "实时";
+    badge.className = "terminal-client-badge active";
+  } else if (isDone) {
+    badge.textContent = "完成";
+    badge.className = "terminal-client-badge";
+  } else if (isActive) {
+    badge.textContent = "运行中";
+    badge.className = "terminal-client-badge active";
+  } else {
+    badge.textContent = "";
+    badge.className = "terminal-client-badge";
+  }
+}
+
+async function loadTerminalContent(client, taskId, taskRound) {
+  const outputEl = document.getElementById(`${client}-output`);
+  if (!outputEl) return;
+
+  try {
+    const meta = await api(`/api/tasks/${taskId}/terminal/${client}`);
+    const current = selectedTask();
+    if (!current || current.id !== taskId || current.round !== taskRound) return;
+
+    if (!meta.exists) {
+      outputEl.textContent = `（${client === "claude" ? "Claude" : "Codex"} CLI 尚未启动或日志文件不存在。）`;
+      return;
+    }
+    const artifacts = await api(`/api/tasks/${taskId}/artifacts`);
+    const current2 = selectedTask();
+    if (!current2 || current2.id !== taskId || current2.round !== taskRound) return;
+
+    const logName = meta.logName;
+    if (artifacts.artifacts && artifacts.artifacts[logName] && artifacts.artifacts[logName].exists) {
+      outputEl.textContent = artifacts.artifacts[logName].content;
+    }
+  } catch (_e) {
+    const current = selectedTask();
+    if (!current || current.id !== taskId || current.round !== taskRound) return;
+    outputEl.textContent = `（无法读取 ${client === "claude" ? "Claude" : "Codex"} 终端输出。）`;
+  }
+}
+
+function refreshTerminalsForTask() {
+  const task = selectedTask();
+  const taskId = task?.id ?? null;
+  const taskRound = task?.round ?? null;
+
+  // Build subscription keys: skip disconnect/reconnect if nothing changed
+  // Include activeClient so that terminal panels refresh when the active client
+  // changes or is corrected by a poll while the task status stays the same.
+  const claudeKey = task ? `${task.id}|${task.round}|claude|${task.status}|${task.activeClient ?? ""}` : null;
+  const codexKey = task ? `${task.id}|${task.round}|codex|${task.status}|${task.activeClient ?? ""}` : null;
+  if (claudeKey === terminalConnections.claude.subKey && codexKey === terminalConnections.codex.subKey) {
+    return;
+  }
+  terminalConnections.claude.subKey = claudeKey;
+  terminalConnections.codex.subKey = codexKey;
+
+  disconnectAllTerminals();
+
+  // Reset both panels to current-task placeholder (never retain old task output)
+  const placeholder = task
+    ? `任务 ${taskId} 轮次 ${taskRound} — 等待终端输出...`
+    : "选择运行中的任务以查看终端输出。";
+  document.getElementById("claude-output").textContent = placeholder;
+  document.getElementById("codex-output").textContent = placeholder;
+
+  if (!task) {
+    updateTerminalBadges();
+    return;
+  }
+
+  if (runningTaskStatuses.has(task.status)) {
+    // Stream for active client, load existing log for inactive client
+    const claudeActive = task.activeClient === "claude" || task.status === "CLAUDE_WINDOW_STARTED";
+    const codexActive = task.activeClient === "codex" || task.status === "CODEX_WINDOW_STARTED";
+    if (claudeActive) connectTerminal("claude"); else loadTerminalContent("claude", taskId, taskRound);
+    if (codexActive) connectTerminal("codex"); else loadTerminalContent("codex", taskId, taskRound);
+  } else {
+    loadTerminalContent("claude", taskId, taskRound);
+    loadTerminalContent("codex", taskId, taskRound);
+    updateTerminalBadges();
+  }
+}
+
 const $ = (id) => document.getElementById(id);
 
 function selectedProject() {
@@ -224,6 +469,7 @@ async function loadTasks() {
   }
   renderTasks();
   await loadArtifacts();
+  refreshTerminalsForTask();
 }
 
 function renderTasks() {
@@ -343,6 +589,7 @@ async function selectTask(id) {
   localStorage.setItem("selectedTaskId", id);
   renderTasks();
   await loadArtifacts();
+  refreshTerminalsForTask();
 }
 
 function renderTaskDetails() {
@@ -459,6 +706,7 @@ async function setTaskView(view) {
   state.activeArtifact = null;
   localStorage.setItem("taskView", view);
   localStorage.removeItem("selectedTaskId");
+  disconnectAllTerminals();
   await loadTasks();
 }
 

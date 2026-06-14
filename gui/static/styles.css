@@ -447,7 +447,7 @@ textarea:focus {
 
 .inspector {
   display: grid;
-  grid-template-rows: auto minmax(320px, 1fr) minmax(250px, 0.9fr);
+  grid-template-rows: auto minmax(180px, 0.6fr) minmax(140px, 0.7fr) minmax(140px, 0.8fr);
   gap: 12px;
   padding: 12px;
 }
@@ -548,9 +548,9 @@ textarea:focus {
 .terminal-grid {
   display: grid;
   grid-template-rows: 1fr 1fr;
-  gap: 10px;
-  height: calc(100% - 56px);
-  min-height: 260px;
+  gap: 8px;
+  height: calc(100% - 52px);
+  min-height: 120px;
 }
 
 .terminal-box {
@@ -564,15 +564,42 @@ textarea:focus {
 }
 
 .terminal-title {
-  padding: 8px 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
   border-bottom: 1px solid var(--code-line);
   background: #17212c;
   color: #b9c6d2;
   font-size: 12px;
 }
 
+.terminal-title .terminal-client-badge {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: #253241;
+  color: #8999ab;
+}
+
+.terminal-title .terminal-client-badge.active {
+  background: #2a7de1;
+  color: #fff;
+}
+
 #claude-output,
-#codex-output,
+#codex-output {
+  margin: 0;
+  overflow: auto;
+  background: var(--code);
+  color: #dce7f0;
+  padding: 10px;
+  line-height: 1.45;
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+
 #task-history,
 #artifact-content {
   margin: 0;
@@ -584,6 +611,17 @@ textarea:focus {
   font-family: Consolas, "Cascadia Mono", monospace;
   font-size: 12px;
   white-space: pre-wrap;
+}
+
+.runtime-terminal-panel {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  padding: 12px;
+}
+
+.runtime-terminal-panel .panel-heading {
+  margin-bottom: 6px;
 }
 
 #task-history {

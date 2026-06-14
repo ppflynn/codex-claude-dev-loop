@@ -150,6 +150,26 @@
           </dl>
         </section>
 
+        <section class="runtime-terminal-panel" id="runtime-terminal-panel">
+          <div class="panel-heading compact">
+            <div>
+              <h3>运行终端</h3>
+              <p>选中任务后，这里会实时显示 Claude/Codex CLI 输出。</p>
+            </div>
+            <span id="terminal-state" class="status-pill">待选择</span>
+          </div>
+          <div class="terminal-grid" id="terminal-grid">
+            <div class="terminal-box" id="claude-terminal-box">
+              <div class="terminal-title">Claude CLI</div>
+              <pre id="claude-output" class="terminal-output">选择运行中的任务以查看终端输出。</pre>
+            </div>
+            <div class="terminal-box" id="codex-terminal-box">
+              <div class="terminal-title">Codex CLI</div>
+              <pre id="codex-output" class="terminal-output">选择运行中的任务以查看终端输出。</pre>
+            </div>
+          </div>
+        </section>
+
         <section class="terminal-panel">
           <div class="panel-heading">
             <div>

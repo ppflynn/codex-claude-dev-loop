@@ -151,5 +151,41 @@ class CliWindowTests(unittest.TestCase):
         self.assertEqual(result["pid"], 123)
 
 
+    def test_launch_cli_window_returns_log_metadata(self):
+        fake_process = mock.Mock(spec=subprocess.Popen)
+        fake_process.pid = 456
+        with mock.patch("gui.orchestrator.cli_window.subprocess.Popen", return_value=fake_process):
+            result = launch_cli_window(
+                task=self.task,
+                task_dir=self.task_dir,
+                kind="claude",
+                command=["claude"],
+                prompt_path=self.prompt,
+            )
+        self.assertIn("logPath", result)
+        self.assertIn("logName", result)
+        self.assertEqual(result["logName"], "claude_window_round_1.log")
+        self.assertIn("claude_window_round_1.log", result["logPath"])
+        self.assertIn(str(self.task_dir), result["logPath"])
+
+    def test_launch_codex_window_returns_log_metadata(self):
+        fake_process = mock.Mock(spec=subprocess.Popen)
+        fake_process.pid = 789
+        output = self.task_dir / "CODEX_REVIEW.json"
+        with mock.patch("gui.orchestrator.cli_window.subprocess.Popen", return_value=fake_process):
+            result = launch_cli_window(
+                task=self.task,
+                task_dir=self.task_dir,
+                kind="codex",
+                command=["codex"],
+                prompt_path=self.prompt,
+                output_path=output,
+            )
+        self.assertIn("logPath", result)
+        self.assertIn("logName", result)
+        self.assertEqual(result["logName"], "codex_window_round_1.log")
+        self.assertIn("codex_window_round_1.log", result["logPath"])
+
+
 if __name__ == "__main__":
     unittest.main()
