@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from gui import server
 from gui.orchestrator.git_tools import GitArtifacts, EnvFileChangedError, GitError
 from gui.orchestrator.models import Task
+from gui.orchestrator.state_machine import Status
 from gui.orchestrator.store import TaskStore
 from gui.orchestrator.test_runner import TestRunResult
 
@@ -696,6 +697,336 @@ class TaskApiCoreTests(unittest.TestCase):
         self.assertEqual(updated.stage, "review_complete")
         self.assertIsNone(updated.activeClient)
         self.assertIsNotNone(updated.lastActivityAt)
+
+
+class TerminalApiTests(unittest.TestCase):
+    def make_store_and_task(self, task_id="task_termtest"):
+        root = server.ROOT / ".gui" / "test-tmp" / f"term-{uuid.uuid4().hex}"
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        task_store = TaskStore(root / "tasks")
+        task = Task.create(
+            task_id=task_id,
+            project_id="project1",
+            project_path=str(root / "project"),
+            title="Terminal Task",
+            description="Test terminal",
+            acceptance="Pass",
+        )
+        task_store.save(task)
+        return root, task_store, task
+
+    def test_resolve_terminal_log_validates_client(self):
+        _root, task_store, task = self.make_store_and_task()
+        with self.assertRaises(server.ApiError) as ctx:
+            server._resolve_terminal_log(task_store, task, "invalid_client")
+        self.assertIn("Invalid terminal client", ctx.exception.message)
+
+    def test_resolve_terminal_log_accepts_claude_and_codex(self):
+        _root, task_store, task = self.make_store_and_task()
+        claude_path = server._resolve_terminal_log(task_store, task, "claude")
+        codex_path = server._resolve_terminal_log(task_store, task, "codex")
+        self.assertEqual(claude_path.name, "claude_window_round_1.log")
+        self.assertEqual(codex_path.name, "codex_window_round_1.log")
+        self.assertIn("task_termtest", str(claude_path))
+
+    def test_terminal_metadata_for_missing_log(self):
+        _root, task_store, task = self.make_store_and_task()
+        meta = server._terminal_metadata(task_store, task, "claude")
+        self.assertEqual(meta["client"], "claude")
+        self.assertEqual(meta["taskId"], "task_termtest")
+        self.assertFalse(meta["exists"])
+        self.assertEqual(meta["size"], 0)
+
+    def test_terminal_metadata_for_existing_log(self):
+        _root, task_store, task = self.make_store_and_task()
+        log_path = task_store.task_dir(task.id) / "claude_window_round_1.log"
+        log_path.write_text("Hello from Claude\n", encoding="utf-8")
+        meta = server._terminal_metadata(task_store, task, "claude")
+        self.assertTrue(meta["exists"])
+        self.assertGreater(meta["size"], 0)
+        self.assertEqual(meta["logName"], "claude_window_round_1.log")
+
+    def test_terminal_metadata_uses_task_round(self):
+        _root, task_store, task = self.make_store_and_task()
+        task.round = 3
+        meta = server._terminal_metadata(task_store, task, "codex")
+        self.assertEqual(meta["logName"], "codex_window_round_3.log")
+
+    def test_terminal_api_endpoint_missing_task_returns_404(self):
+        handler = _make_handler("GET", "/api/tasks/task_nonexistent/terminal/claude")
+        handler.do_GET()
+        self.assertEqual(handler._status, 404)
+
+    def test_terminal_api_endpoint_invalid_client_returns_400(self):
+        root = server.ROOT / ".gui" / "test-tmp" / f"termapi-{uuid.uuid4().hex}"
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        task_store = TaskStore(root / "tasks")
+        task = Task.create(
+            task_id="task_termapi01",
+            project_id="project1",
+            project_path=str(root / "project"),
+            title="T", description="D", acceptance="A",
+        )
+        task_store.save(task)
+
+        with mock.patch.object(server.GuiHandler, "tasks", task_store):
+            handler = _make_handler("GET", f"/api/tasks/{task.id}/terminal/evil")
+            handler.do_GET()
+            self.assertEqual(handler._status, 400)
+
+    def test_terminal_api_endpoint_returns_metadata(self):
+        root = server.ROOT / ".gui" / "test-tmp" / f"termapi-{uuid.uuid4().hex}"
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        task_store = TaskStore(root / "tasks")
+        task = Task.create(
+            task_id="task_termapi02",
+            project_id="project1",
+            project_path=str(root / "project"),
+            title="T", description="D", acceptance="A",
+        )
+        task_store.save(task)
+        log_path = task_store.task_dir(task.id) / "claude_window_round_1.log"
+        log_path.write_text("test output\n", encoding="utf-8")
+
+        with mock.patch.object(server.GuiHandler, "tasks", task_store):
+            handler = _make_handler("GET", f"/api/tasks/{task.id}/terminal/claude")
+            handler.do_GET()
+            self.assertEqual(handler._status, 200)
+            body = json.loads(handler._body())
+            self.assertTrue(body["exists"])
+            self.assertEqual(body["client"], "claude")
+            self.assertEqual(body["logName"], "claude_window_round_1.log")
+
+    def test_terminal_stream_captured_round_survives_round_advance(self):
+        """P2-1 regression: stream must keep reading original round log after task.round advances."""
+        from unittest import mock as umock
+
+        _root, task_store, task = self.make_store_and_task()
+        task.status = Status.CODEX_WINDOW_STARTED
+        task.round = 1
+        task_store.save(task)
+
+        log_path = task_store.task_dir(task.id) / "codex_window_round_1.log"
+        log_path.write_text("line1\nline2\n", encoding="utf-8")
+
+        # Pre-create the round-2 log with poison content so we can detect if the
+        # stream ever switches to it after the round advances.
+        log_path_r2 = task_store.task_dir(task.id) / "codex_window_round_2.log"
+        log_path_r2.write_text("WRONG-ROUND\n", encoding="utf-8")
+
+        wfile = _FakeWfile(None)
+        flush_count = [0]
+
+        def flush():
+            flush_count[0] += 1
+
+        sleep_count = [0]
+
+        def fake_sleep(_):
+            sleep_count[0] += 1
+            if sleep_count[0] == 1:
+                # After the first read, advance the round and append more data
+                # to the *original* round-1 log.
+                task.round = 2
+                task_store.save(task)
+                with log_path.open("a", encoding="utf-8") as f:
+                    f.write("line3\n")
+            elif sleep_count[0] == 2:
+                # After the second read, mark the task complete.
+                task.status = Status.WAITING_FOR_CLAUDE
+                task_store.save(task)
+
+        with umock.patch("time.sleep", fake_sleep):
+            server._terminal_stream(task_store, task.id, "codex", wfile, flush)
+
+        output = b"".join(wfile._buf).decode("utf-8")
+        self.assertIn("line1", output)
+        self.assertIn("line2", output)
+        self.assertIn("line3", output)
+        self.assertNotIn("WRONG-ROUND", output)
+
+    def test_terminal_stream_multibyte_no_duplicate_or_corrupt(self):
+        """P2-1: appending multibyte text mid-stream emits each line exactly once."""
+        from unittest import mock as umock
+
+        _root, task_store, task = self.make_store_and_task()
+        task.status = Status.CODEX_WINDOW_STARTED
+        task.round = 1
+        task_store.save(task)
+
+        log_path = task_store.task_dir(task.id) / "codex_window_round_1.log"
+        # Start with ASCII, then append multibyte Chinese text between polls
+        log_path.write_text("line1\n", encoding="utf-8")
+
+        wfile = _FakeWfile(None)
+
+        def flush():
+            pass
+
+        sleep_count = [0]
+        content_plan = [
+            "第2行中文内容\n",          # multibyte append after first read
+            "line3 with trailing 中文\n",
+        ]
+
+        def fake_sleep(_):
+            sleep_count[0] += 1
+            idx = sleep_count[0] - 1
+            if idx < len(content_plan):
+                with log_path.open("ab") as f:
+                    f.write(content_plan[idx].encode("utf-8"))
+            elif idx == len(content_plan):
+                task.status = Status.WAITING_FOR_CLAUDE
+                task_store.save(task)
+
+        with umock.patch("time.sleep", fake_sleep):
+            server._terminal_stream(task_store, task.id, "codex", wfile, flush)
+
+        output = b"".join(wfile._buf).decode("utf-8")
+        self.assertIn("line1", output)
+        self.assertIn("第2行中文内容", output)
+        self.assertIn("line3 with trailing 中文", output)
+        # Each line must appear exactly once across SSE data payloads
+        self.assertEqual(output.count("line1"), 1)
+        self.assertEqual(output.count("第2行中文内容"), 1)
+        self.assertEqual(output.count("line3 with trailing 中文"), 1)
+
+    def test_terminal_stream_split_multibyte_character_no_corruption(self):
+        """P2-1: a UTF-8 character split across poll cycles is emitted correctly once."""
+        from unittest import mock as umock
+
+        _root, task_store, task = self.make_store_and_task()
+        task.status = Status.CODEX_WINDOW_STARTED
+        task.round = 1
+        task_store.save(task)
+
+        log_path = task_store.task_dir(task.id) / "codex_window_round_1.log"
+        # "中" is \xe4\xb8\xad (3 bytes). Write first 2 bytes now.
+        log_path.write_bytes(b"prefix:")
+
+        wfile = _FakeWfile(None)
+
+        def flush():
+            pass
+
+        sleep_count = [0]
+        plan = [
+            b"\xe4\xb8",           # first 2 of 3 bytes for "中" — split across boundary
+            b"\xad\n",             # 3rd byte + newline
+        ]
+
+        def fake_sleep(_):
+            sleep_count[0] += 1
+            idx = sleep_count[0] - 1
+            if idx < len(plan):
+                with log_path.open("ab") as f:
+                    f.write(plan[idx])
+            elif idx == len(plan):
+                task.status = Status.WAITING_FOR_CLAUDE
+                task_store.save(task)
+
+        with umock.patch("time.sleep", fake_sleep):
+            server._terminal_stream(task_store, task.id, "codex", wfile, flush)
+
+        output = b"".join(wfile._buf).decode("utf-8")
+        self.assertIn("中", output)
+        self.assertEqual(output.count("中"), 1)
+        # With incremental decoder, no replacement characters should appear for
+        # the split sequence.
+        self.assertNotIn("�", output)
+
+    def test_terminal_stream_endpoint_missing_log_still_responds(self):
+        root = server.ROOT / ".gui" / "test-tmp" / f"termstream-{uuid.uuid4().hex}"
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        task_store = TaskStore(root / "tasks")
+        task = Task.create(
+            task_id="task_termstrm1",
+            project_id="project1",
+            project_path=str(root / "project"),
+            title="T", description="D", acceptance="A",
+        )
+        task_store.save(task)
+
+        with mock.patch.object(server.GuiHandler, "tasks", task_store):
+            handler = _make_handler("GET", f"/api/tasks/{task.id}/terminal/claude/stream")
+            handler.do_GET()
+            self.assertEqual(handler._status, 200)
+            self.assertIn("text/event-stream", handler._content_type())
+
+
+def _make_handler(method, path, body=None):
+    """Create a GuiHandler with headers wired for testing."""
+    handler = server.GuiHandler.__new__(server.GuiHandler)
+    handler.command = method
+    handler.path = path
+    handler.headers = {}
+    handler._status = None
+    handler._response_body = None
+    handler._response_headers = {}
+
+    original_send_response = handler.send_response
+
+    def send_response(code):
+        handler._status = code
+
+    handler.send_response = send_response
+
+    def send_header(key, value):
+        handler._response_headers[key] = value
+
+    handler.send_header = send_header
+
+    def end_headers():
+        pass
+
+    handler.end_headers = end_headers
+
+    handler.wfile = _FakeWfile(handler)
+
+    if body:
+        handler.rfile = _FakeRfile(body)
+    else:
+        handler.rfile = _FakeRfile("")
+
+    return handler
+
+
+class _FakeWfile:
+    def __init__(self, handler):
+        self._handler = handler
+        self._buf = []
+
+    def write(self, data):
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        self._buf.append(data)
+
+    def flush(self):
+        pass
+
+
+class _FakeRfile:
+    def __init__(self, content):
+        self._content = content.encode("utf-8") if isinstance(content, str) else content
+
+    def read(self, length):
+        return self._content[:length]
+
+
+def _body(self):
+    if hasattr(self, "_response_body") and self._response_body is not None:
+        return self._response_body
+    if self.wfile and self.wfile._buf:
+        return b"".join(self.wfile._buf).decode("utf-8")
+    return ""
+
+server.GuiHandler._body = _body
+
+
+def _content_type(self):
+    return self._response_headers.get("Content-Type", "")
+
+server.GuiHandler._content_type = _content_type
 
 
 def utc_now():

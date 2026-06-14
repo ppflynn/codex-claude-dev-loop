@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import hashlib
 import json
 import mimetypes
@@ -847,7 +848,98 @@ def cancel_task(task_id: str, task_store: TaskStore):
     return task
 
 
+VALID_TERMINAL_CLIENTS = {"claude", "codex"}
 RUNNING_TASK_STATUSES = {Status.CLAUDE_WINDOW_STARTED, Status.CODEX_WINDOW_STARTED}
+
+
+def _resolve_terminal_log(task_store, task, client: str, fallback: bool = False) -> Path:
+    """Construct and validate the terminal log path for a task and client.
+
+    When fallback is True and the current round's log does not exist, try
+    earlier rounds so the web UI can still show output from a completed
+    round (e.g. after Codex returns NEEDS_FIX and the round is advanced).
+    """
+    if client not in VALID_TERMINAL_CLIENTS:
+        raise ApiError(HTTPStatus.BAD_REQUEST, f"Invalid terminal client: {client}")
+    task_dir = task_store.task_dir(task.id)
+    log_path = task_dir / f"{client}_window_round_{task.round}.log"
+    if fallback and not log_path.is_file():
+        for r in range(task.round - 1, 0, -1):
+            candidate = task_dir / f"{client}_window_round_{r}.log"
+            if candidate.is_file():
+                log_path = candidate
+                break
+    try:
+        from gui.orchestrator.path_safety import ensure_child_path
+        return ensure_child_path(task_dir, log_path)
+    except Exception as exc:
+        raise ApiError(HTTPStatus.BAD_REQUEST, f"Unsafe log path: {exc}")
+
+
+def _terminal_metadata(task_store, task, client: str) -> dict[str, Any]:
+    # Only use fallback when round was bumped (WAITING_FOR_CLAUDE after NEEDS_FIX)
+    # so the web UI can still show the previous round's output. For states like
+    # WAITING_FOR_CODEX where the current client hasn't started, return the
+    # current-round metadata with exists=false instead of stale earlier-round logs.
+    should_fallback = task.status == Status.WAITING_FOR_CLAUDE
+    log_path = _resolve_terminal_log(task_store, task, client, fallback=should_fallback)
+    exists = log_path.is_file()
+    return {
+        "taskId": task.id,
+        "client": client,
+        "logName": log_path.name,
+        "exists": exists,
+        "size": log_path.stat().st_size if exists else 0,
+    }
+
+
+def _terminal_stream(task_store, task_id: str, client: str, wfile, flush):
+    """SSE stream generator for terminal log output. Reloads task only for completion checks."""
+    sent_bytes = 0
+    waiting_sent = False
+    task = task_store.load(task_id)
+    log_path = _resolve_terminal_log(task_store, task, client)
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    while True:
+        current_size = log_path.stat().st_size if log_path.is_file() else 0
+        if current_size > sent_bytes:
+            with log_path.open("rb") as handle:
+                handle.seek(sent_bytes)
+                raw = handle.read(current_size - sent_bytes)
+            chunk = decoder.decode(raw, final=False)
+            sent_bytes = current_size
+            if chunk:
+                payload = json.dumps({"chunk": chunk, "offset": sent_bytes, "done": False}, ensure_ascii=False)
+                wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                flush()
+            if "CLI exit code:" in chunk:
+                # Flush any bytes remaining in the decoder before closing
+                tail = decoder.decode(b"", final=True)
+                if tail:
+                    payload = json.dumps({"chunk": tail, "offset": sent_bytes, "done": False}, ensure_ascii=False)
+                    wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                    flush()
+                payload = json.dumps({"chunk": "", "offset": sent_bytes, "done": True}, ensure_ascii=False)
+                wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                flush()
+                return
+        elif not waiting_sent:
+            waiting_sent = True
+            payload = json.dumps({"chunk": "", "offset": 0, "done": False, "waiting": True}, ensure_ascii=False)
+            wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+            flush()
+        task = task_store.load(task_id)
+        if task.status not in RUNNING_TASK_STATUSES:
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                payload = json.dumps({"chunk": tail, "offset": sent_bytes, "done": False}, ensure_ascii=False)
+                wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                flush()
+            done_payload = json.dumps({"chunk": "", "offset": sent_bytes, "done": True}, ensure_ascii=False)
+            wfile.write(f"data: {done_payload}\n\n".encode("utf-8"))
+            flush()
+            return
+        time.sleep(0.5)
 
 
 def ensure_task_not_running(task) -> None:
@@ -941,6 +1033,11 @@ class GuiHandler(BaseHTTPRequestHandler):
                 self.send_json({"task": task.to_dict()})
             elif match := re.fullmatch(r"/api/tasks/([^/]+)/artifacts", path):
                 self.send_json({"artifacts": self.tasks.read_artifacts(match.group(1))})
+            elif match := re.fullmatch(r"/api/tasks/([^/]+)/terminal/([^/]+)", path):
+                task = self.tasks.load(match.group(1))
+                self.send_json(_terminal_metadata(self.tasks, task, match.group(2)))
+            elif match := re.fullmatch(r"/api/tasks/([^/]+)/terminal/([^/]+)/stream", path):
+                self.handle_terminal_stream(match.group(1), match.group(2))
             elif path == "/api/runs/current":
                 self.send_json({"run": self.runs.snapshot()})
             elif path == "/api/runs/current/stream":
@@ -1076,6 +1173,27 @@ class GuiHandler(BaseHTTPRequestHandler):
                 payload = json.dumps(event, ensure_ascii=False)
                 self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
                 self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+    def handle_terminal_stream(self, task_id: str, client: str) -> None:
+        try:
+            task = self.tasks.load(task_id)
+        except TaskStoreError as exc:
+            self.send_error_json(HTTPStatus.NOT_FOUND, str(exc))
+            return
+        try:
+            _resolve_terminal_log(self.tasks, task, client)
+        except ApiError as exc:
+            self.send_error_json(exc.status, exc.message)
+            return
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        try:
+            _terminal_stream(self.tasks, task_id, client, self.wfile, self.wfile.flush)
         except (BrokenPipeError, ConnectionResetError):
             return
 

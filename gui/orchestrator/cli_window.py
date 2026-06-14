@@ -393,6 +393,7 @@ def launch_cli_window(
         prompt_path=prompt_path,
         output_path=output_path,
     )
+    log_path = task_dir / f"{kind}_window_round_{task.round}.log"
     available = shutil.which(command[0]) is not None
     process = launch_powershell_window(script_path)
     return {
@@ -400,6 +401,8 @@ def launch_cli_window(
         "command": command,
         "pid": process.pid,
         "cliAvailable": available,
+        "logPath": str(log_path),
+        "logName": log_path.name,
     }
 
 
