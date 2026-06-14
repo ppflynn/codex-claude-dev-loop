@@ -16,6 +16,13 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(treeView);
 
   context.subscriptions.push(
+    vscode.commands.registerCommand('codexClaudeDevLoop.openView', async () => {
+      await vscode.commands.executeCommand('workbench.view.extension.codexClaudeDevLoop');
+      taskTreeProvider.refresh();
+    })
+  );
+
+  context.subscriptions.push(
     vscode.commands.registerCommand('codexClaudeDevLoop.refreshTasks', () => {
       taskTreeProvider.refresh();
     })
