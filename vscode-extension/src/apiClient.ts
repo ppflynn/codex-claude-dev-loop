@@ -95,6 +95,11 @@ export async function createTask(params: {
   return data.task;
 }
 
+export async function fetchTaskDetail(taskId: string): Promise<Task> {
+  const data = await request<{ task: Task }>(`/api/tasks/${taskId}`);
+  return data.task;
+}
+
 export async function fetchTaskArtifacts(taskId: string): Promise<Record<string, TaskArtifact>> {
   const data = await request<{ artifacts: Record<string, TaskArtifact> }>(`/api/tasks/${taskId}/artifacts`);
   return data.artifacts;

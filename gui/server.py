@@ -47,6 +47,7 @@ from gui.orchestrator.state_machine import (
     cancel as cancel_status,
     transition,
 )
+from gui.orchestrator.models import utc_now as utc_now_str
 from gui.orchestrator.store import TaskStore, TaskStoreError
 from gui.orchestrator.test_runner import run_tests
 
@@ -664,6 +665,10 @@ def launch_claude_task(task_id: str, project_store: ProjectStore, task_store: Ta
     task.claudeWindow = adapter.launch(task, task_dir, prompt_path)
     task.add_artifact(prompt_path.name, prompt_path.name)
     task.add_artifact(Path(task.claudeWindow["script"]).name, Path(task.claudeWindow["script"]).name)
+    task.progress = 20
+    task.stage = "claude_running"
+    task.activeClient = "claude"
+    task.lastActivityAt = utc_now_str()
     set_task_status(task, Status.CLAUDE_WINDOW_STARTED, "Claude CLI window launched.")
     task_store.save(task)
     return task
@@ -688,11 +693,36 @@ def complete_claude_task(task_id: str, project_store: ProjectStore, task_store: 
         ):
             if (task_dir / name).exists():
                 task.add_artifact(name, name)
+        task.progress = 20
+        task.activeClient = None
+        task.stage = "git_collection_failed"
+        task.lastActivityAt = utc_now_str()
         set_task_status(task, Status.FAILED, str(exc))
         task_store.save(task)
         return task
     except GitError as exc:
+        task.progress = 20
+        task.activeClient = None
+        task.stage = "git_collection_failed"
+        task.lastActivityAt = utc_now_str()
         set_task_status(task, Status.FAILED, f"Git artifact collection failed: {exc}")
+        task_store.save(task)
+        return task
+
+    diff_content = ""
+    if git_artifacts.diff_path.is_file():
+        diff_content = git_artifacts.diff_path.read_text(encoding="utf-8", errors="replace").strip()
+
+    status_has_changes = bool(git_artifacts.status.strip())
+    diff_stat_nonempty = bool(git_artifacts.diff_stat.strip())
+
+    if not diff_content and not status_has_changes and not diff_stat_nonempty:
+        task.progress = 100
+        task.activeClient = None
+        task.stage = "no_changes"
+        task.lastActivityAt = utc_now_str()
+        task.add_history("NO_DIFF_DETECTED", "Claude 完成后未检测到实现改动（Git diff 为空），任务标记为失败。")
+        set_task_status(task, Status.FAILED, "未检测到实现改动")
         task_store.save(task)
         return task
 
@@ -701,6 +731,10 @@ def complete_claude_task(task_id: str, project_store: ProjectStore, task_store: 
         task.add_artifact(test_result.path.name, test_result.path.name)
     review_prompt = write_codex_review_prompt(task, task_dir)
     task.add_artifact(review_prompt.name, review_prompt.name)
+    task.progress = 50
+    task.stage = "waiting_for_codex"
+    task.activeClient = None
+    task.lastActivityAt = utc_now_str()
     set_task_status(task, Status.WAITING_FOR_CODEX, "Git and test artifacts collected; Codex prompt generated.")
     task_store.save(task)
     return task
@@ -721,6 +755,10 @@ def launch_codex_task(task_id: str, project_store: ProjectStore, task_store: Tas
     task.codexWindow = adapter.launch(task, task_dir, prompt_path, output_path)
     task.add_artifact(prompt_path.name, prompt_path.name)
     task.add_artifact(Path(task.codexWindow["script"]).name, Path(task.codexWindow["script"]).name)
+    task.progress = 60
+    task.stage = "codex_running"
+    task.activeClient = "codex"
+    task.lastActivityAt = utc_now_str()
     set_task_status(task, Status.CODEX_WINDOW_STARTED, "Codex CLI window launched.")
     task_store.save(task)
     return task
@@ -746,6 +784,10 @@ def complete_codex_task(task_id: str, project_store: ProjectStore, task_store: T
             detail = f"{detail} Check {log_path.name} for the launcher output."
             task.add_artifact(log_path.name, log_path.name)
         task.add_history("CODEX_REVIEW_MISSING", detail)
+        task.progress = 50
+        task.stage = "waiting_for_codex"
+        task.activeClient = None
+        task.lastActivityAt = utc_now_str()
         set_task_status(task, Status.WAITING_FOR_CODEX, detail)
         task_store.save(task)
         return task
@@ -753,6 +795,10 @@ def complete_codex_task(task_id: str, project_store: ProjectStore, task_store: T
         review = load_review_report(review_path)
     except ReportValidationError as exc:
         task.add_history("CODEX_REVIEW_INVALID", str(exc))
+        task.progress = 100
+        task.activeClient = None
+        task.stage = "review_invalid"
+        task.lastActivityAt = utc_now_str()
         set_task_status(task, Status.FAILED, f"Codex review validation failed: {exc}")
         task_store.save(task)
         return task
@@ -760,12 +806,20 @@ def complete_codex_task(task_id: str, project_store: ProjectStore, task_store: T
     task.add_artifact(review_path.name, review_path.name)
     review_status = str(review["status"])
     if review_status in {Status.PASS, Status.BLOCKED, Status.FAILED}:
+        task.progress = 100
+        task.activeClient = None
+        task.stage = "review_complete"
+        task.lastActivityAt = utc_now_str()
         set_task_status(task, review_status, f"Codex review completed with {review_status}.")
         task_store.save(task)
         return task
 
     set_task_status(task, Status.NEEDS_FIX, "Codex review requested fixes.")
     if task.round >= task.maxRounds:
+        task.progress = 100
+        task.activeClient = None
+        task.stage = "max_rounds_exhausted"
+        task.lastActivityAt = utc_now_str()
         set_task_status(task, Status.FAILED, "Maximum rounds exhausted after NEEDS_FIX.")
         task_store.save(task)
         return task
@@ -773,6 +827,10 @@ def complete_codex_task(task_id: str, project_store: ProjectStore, task_store: T
     next_round = task.round + 1
     write_fix_prompt(task, task_dir, review, next_round)
     task.round = next_round
+    task.progress = 20
+    task.stage = f"fix_round_{next_round}"
+    task.activeClient = None
+    task.lastActivityAt = utc_now_str()
     set_task_status(task, Status.WAITING_FOR_CLAUDE, f"Fix prompt generated for round {next_round}.")
     task_store.save(task)
     return task
@@ -780,6 +838,10 @@ def complete_codex_task(task_id: str, project_store: ProjectStore, task_store: T
 
 def cancel_task(task_id: str, task_store: TaskStore):
     task = task_store.load(task_id)
+    task.progress = 100 if task.progress == 0 else task.progress
+    task.activeClient = None
+    task.stage = "cancelled"
+    task.lastActivityAt = utc_now_str()
     task.set_status(cancel_status(task.status), "Task cancelled by user.")
     task_store.save(task)
     return task

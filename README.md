@@ -25,6 +25,30 @@ http://127.0.0.1:8765/
 powershell -ExecutionPolicy Bypass -File scripts\start-gui.ps1 -Port 8787
 ```
 
+### 1.1 VS Code 插件
+
+本仓库自带 VS Code 侧边栏插件，源码在 `vscode-extension/`。插件默认连接：
+
+```text
+http://127.0.0.1:8765
+```
+
+开发或更新插件后，需要先编译 TypeScript，让 VS Code 实际加载的 `out/` 产物同步到最新代码：
+
+```powershell
+cd vscode-extension
+npm.cmd run compile
+```
+
+如果使用的是已安装到本机的插件，还需要把 `package.json`、`resources/` 和编译后的 `out/` 同步到 VS Code 扩展目录，然后在 VS Code 中执行 **Developer: Reload Window** 重新加载扩展宿主。
+
+当前插件能力：
+
+- Activity Bar 显示 **AI Dev Loop** 侧边栏。
+- 支持刷新任务、创建任务、打开 `PLAN.md`、Claude prompt、Codex prompt 和实施报告。
+- 任务树会显示轮次、状态、运行端和进度；Claude/Codex 运行中会显示旋转图标。
+- 右键任务可打开 **Open Task Detail**，查看任务 ID、状态、进度、阶段、运行端、描述、验收标准和历史记录。
+
 ### 2. 导入或初始化项目
 
 在界面左侧的 **“导入项目目录”** 输入项目文件夹路径，例如：
@@ -288,6 +312,16 @@ GUI 右侧 **“运行产物”** 会显示这些文件：
 │   ├── claude-run.log             ← Claude 执行日志（自动生成，密文已脱敏）
 │   ├── TEST_REPORT.md             ← 测试报告
 │   └── AUDIT.md                   ← 代码审计报告
+├── gui/                            ← 本地图形界面和 HTTP API
+│   ├── server.py                   ← Web/API 服务入口
+│   ├── static/                     ← 浏览器界面资源
+│   └── orchestrator/               ← 任务模型、状态机、Git 和测试编排逻辑
+├── vscode-extension/               ← VS Code 侧边栏插件
+│   ├── src/                        ← 插件 TypeScript 源码
+│   ├── out/                        ← 编译后的插件产物（VS Code 实际加载）
+│   ├── resources/                  ← Activity Bar 图标等资源
+│   └── package.json                ← 插件命令、菜单和配置声明
+├── tests/                          ← Python 自动化测试
 ├── demo-project/                   ← 简单测试项目（用于验证工具）
 │   ├── package.json
 │   ├── index.js

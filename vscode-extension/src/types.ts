@@ -24,6 +24,19 @@ export interface Task {
   archivedAt: string | null;
   deletedAt: string | null;
   artifacts: TaskArtifact[];
+  progress: number;
+  stage: string;
+  activeClient: string | null;
+  lastActivityAt: string | null;
+  history?: TaskHistoryItem[];
+}
+
+export interface TaskHistoryItem {
+  at: string;
+  event: string;
+  message: string;
+  previous?: string;
+  status?: string;
 }
 
 export interface TaskArtifact {

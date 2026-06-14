@@ -12,7 +12,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from gui import server
-from gui.orchestrator.git_tools import GitArtifacts
+from gui.orchestrator.git_tools import GitArtifacts, EnvFileChangedError, GitError
 from gui.orchestrator.models import Task
 from gui.orchestrator.store import TaskStore
 from gui.orchestrator.test_runner import TestRunResult
@@ -363,6 +363,344 @@ class TaskApiCoreTests(unittest.TestCase):
 
         with self.assertRaises(server.ApiError):
             server.remove_project("project1", project_store, task_store, server.RunManager(project_store))
+
+
+    def test_empty_diff_after_claude_marks_task_failed(self):
+        _root, _project, project_store, task_store = self.make_project_store()
+        task = self.create_waiting_task(project_store, task_store)
+        task.status = "CLAUDE_WINDOW_STARTED"
+        task_store.save(task)
+        task_dir = task_store.task_dir(task.id)
+
+        def fake_collect_empty(_project_path, task_path, round_number):
+            status_path = task_path / f"git_status_round_{round_number}.txt"
+            diff_stat_path = task_path / f"git_diff_stat_round_{round_number}.txt"
+            diff_path = task_path / f"git_diff_round_{round_number}.diff"
+            status_path.write_text("", encoding="utf-8")
+            diff_stat_path.write_text("", encoding="utf-8")
+            diff_path.write_text("", encoding="utf-8")
+            return GitArtifacts(status_path, diff_stat_path, diff_path, "", "", "")
+
+        with (
+            mock.patch("gui.server.assert_git_work_tree"),
+            mock.patch("gui.server.collect_git_artifacts", side_effect=fake_collect_empty),
+        ):
+            updated = server.complete_claude_task(task.id, project_store, task_store)
+
+        self.assertEqual(updated.status, "FAILED")
+        self.assertEqual(updated.stage, "no_changes")
+        self.assertIsNone(updated.activeClient)
+        self.assertEqual(updated.progress, 100)
+        history_events = [h["event"] for h in updated.history]
+        self.assertIn("NO_DIFF_DETECTED", history_events)
+        self.assertFalse((task_dir / "CODEX_REVIEW_PROMPT.md").exists())
+
+    def test_staged_only_changes_not_treated_as_no_diff(self):
+        _root, _project, project_store, task_store = self.make_project_store()
+        task = self.create_waiting_task(project_store, task_store)
+        task.status = "CLAUDE_WINDOW_STARTED"
+        task_store.save(task)
+
+        def fake_collect_staged_only(_project_path, task_path, round_number):
+            status_path = task_path / f"git_status_round_{round_number}.txt"
+            diff_stat_path = task_path / f"git_diff_stat_round_{round_number}.txt"
+            diff_path = task_path / f"git_diff_round_{round_number}.diff"
+            status_path.write_text("M  staged_file.py", encoding="utf-8")
+            diff_stat_path.write_text(" staged_file.py | 5 +++++", encoding="utf-8")
+            diff_path.write_text("", encoding="utf-8")
+            return GitArtifacts(status_path, diff_stat_path, diff_path,
+                              "M  staged_file.py", " staged_file.py | 5 +++++", "")
+
+        with (
+            mock.patch("gui.server.assert_git_work_tree"),
+            mock.patch("gui.server.collect_git_artifacts", side_effect=fake_collect_staged_only),
+            mock.patch("gui.server.run_tests") as mock_run_tests,
+        ):
+            mock_run_tests.return_value = mock.MagicMock(path=None)
+            updated = server.complete_claude_task(task.id, project_store, task_store)
+
+        self.assertNotEqual(updated.status, "FAILED")
+        self.assertNotEqual(updated.stage, "no_changes")
+        mock_run_tests.assert_called_once()
+
+    def test_missing_codex_review_sets_consistent_progress_and_stage(self):
+        _root, _project, project_store, task_store = self.make_project_store()
+        task = self.create_waiting_task(project_store, task_store)
+        task.status = "CODEX_WINDOW_STARTED"
+        task.progress = 60
+        task.stage = "codex_running"
+        task.activeClient = "codex"
+        task_store.save(task)
+        task_dir = task_store.task_dir(task.id)
+
+        def fake_collect_git(_project_path, task_path, round_number):
+            status_path = task_path / f"git_status_round_{round_number}.txt"
+            diff_stat_path = task_path / f"git_diff_stat_round_{round_number}.txt"
+            diff_path = task_path / f"git_diff_round_{round_number}.diff"
+            status_path.write_text("M modified.py", encoding="utf-8")
+            diff_stat_path.write_text(" modified.py | 3 +++", encoding="utf-8")
+            diff_path.write_text("+code change", encoding="utf-8")
+            return GitArtifacts(status_path, diff_stat_path, diff_path,
+                              "M modified.py", " modified.py | 3 +++", "+code change")
+
+        with (
+            mock.patch("gui.server.assert_git_work_tree"),
+            mock.patch("gui.server.collect_git_artifacts", side_effect=fake_collect_git),
+            mock.patch("gui.server.run_tests") as mock_run_tests,
+        ):
+            mock_run_tests.return_value = mock.MagicMock(path=mock.MagicMock(name="test_result.txt"))
+            updated = server.complete_codex_task(task.id, project_store, task_store)
+
+        self.assertEqual(updated.status, "WAITING_FOR_CODEX")
+        self.assertEqual(updated.progress, 50)
+        self.assertEqual(updated.stage, "waiting_for_codex")
+        self.assertIsNone(updated.activeClient)
+        history_events = [h["event"] for h in updated.history]
+        self.assertIn("CODEX_REVIEW_MISSING", history_events)
+
+    def test_task_api_returns_progress_fields(self):
+        _root, _project, project_store, task_store = self.make_project_store()
+        task = self.create_waiting_task(project_store, task_store)
+
+        d = task.to_dict()
+        self.assertIn("progress", d)
+        self.assertIn("stage", d)
+        self.assertIn("activeClient", d)
+        self.assertIn("lastActivityAt", d)
+        self.assertEqual(d["progress"], 0)
+        self.assertEqual(d["stage"], "created")
+        self.assertIsNone(d["activeClient"])
+        self.assertIsNotNone(d["lastActivityAt"])
+
+        task.status = "CLAUDE_WINDOW_STARTED"
+        task.progress = 20
+        task.stage = "claude_running"
+        task.activeClient = "claude"
+        task.lastActivityAt = utc_now()
+        task_store.save(task)
+
+        reloaded = task_store.load(task.id)
+        self.assertEqual(reloaded.progress, 20)
+        self.assertEqual(reloaded.stage, "claude_running")
+        self.assertEqual(reloaded.activeClient, "claude")
+        self.assertIsNotNone(reloaded.lastActivityAt)
+
+
+    def test_env_file_changed_during_claude_completion_clears_progress_fields(self):
+        _root, _project, project_store, task_store = self.make_project_store()
+        task = self.create_waiting_task(project_store, task_store)
+        task.status = "CLAUDE_WINDOW_STARTED"
+        task.progress = 20
+        task.stage = "claude_running"
+        task.activeClient = "claude"
+        task_store.save(task)
+
+        with (
+            mock.patch("gui.server.assert_git_work_tree"),
+            mock.patch(
+                "gui.server.collect_git_artifacts",
+                side_effect=EnvFileChangedError("Working tree files are out of sync"),
+            ),
+        ):
+            updated = server.complete_claude_task(task.id, project_store, task_store)
+
+        self.assertEqual(updated.status, "FAILED")
+        self.assertEqual(updated.stage, "git_collection_failed")
+        self.assertIsNone(updated.activeClient)
+        self.assertEqual(updated.progress, 20)
+        self.assertIsNotNone(updated.lastActivityAt)
+
+    def test_from_dict_legacy_claude_running_derives_fields_from_status(self):
+        legacy = {
+            "id": "task_legacy1",
+            "projectId": "proj1",
+            "projectPath": "/test",
+            "title": "Legacy Claude Task",
+            "description": "No new fields",
+            "acceptance": "",
+            "testCommand": "",
+            "status": "CLAUDE_WINDOW_STARTED",
+            "round": 1,
+            "maxRounds": 3,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z",
+            "artifacts": [],
+            "history": [],
+        }
+        task = Task.from_dict(legacy)
+        self.assertEqual(task.progress, 20)
+        self.assertEqual(task.stage, "claude_running")
+        self.assertEqual(task.activeClient, "claude")
+        self.assertIsNotNone(task.lastActivityAt)
+
+    def test_from_dict_legacy_codex_running_derives_fields_from_status(self):
+        legacy = {
+            "id": "task_legacy2",
+            "projectId": "proj1",
+            "projectPath": "/test",
+            "title": "Legacy Codex Task",
+            "description": "No new fields",
+            "acceptance": "",
+            "testCommand": "",
+            "status": "CODEX_WINDOW_STARTED",
+            "round": 1,
+            "maxRounds": 3,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z",
+            "artifacts": [],
+            "history": [],
+        }
+        task = Task.from_dict(legacy)
+        self.assertEqual(task.progress, 60)
+        self.assertEqual(task.stage, "codex_running")
+        self.assertEqual(task.activeClient, "codex")
+
+    def test_from_dict_legacy_waiting_for_codex_derives_fields(self):
+        legacy = {
+            "id": "task_legacy3",
+            "projectId": "proj1",
+            "projectPath": "/test",
+            "title": "Legacy Waiting Task",
+            "description": "No new fields",
+            "acceptance": "",
+            "testCommand": "",
+            "status": "WAITING_FOR_CODEX",
+            "round": 1,
+            "maxRounds": 3,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z",
+            "artifacts": [],
+            "history": [],
+        }
+        task = Task.from_dict(legacy)
+        self.assertEqual(task.progress, 50)
+        self.assertEqual(task.stage, "waiting_for_codex")
+        self.assertIsNone(task.activeClient)
+
+    def test_from_dict_legacy_failed_derives_fields(self):
+        legacy = {
+            "id": "task_legacy4",
+            "projectId": "proj1",
+            "projectPath": "/test",
+            "title": "Legacy Failed Task",
+            "description": "No new fields",
+            "acceptance": "",
+            "testCommand": "",
+            "status": "FAILED",
+            "round": 1,
+            "maxRounds": 3,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z",
+            "artifacts": [],
+            "history": [],
+        }
+        task = Task.from_dict(legacy)
+        self.assertEqual(task.progress, 100)
+        self.assertEqual(task.stage, "no_changes")
+        self.assertIsNone(task.activeClient)
+
+    def test_from_dict_legacy_cancelled_derives_fields(self):
+        legacy = {
+            "id": "task_legacy5",
+            "projectId": "proj1",
+            "projectPath": "/test",
+            "title": "Legacy Cancelled Task",
+            "description": "No new fields",
+            "acceptance": "",
+            "testCommand": "",
+            "status": "CANCELLED",
+            "round": 1,
+            "maxRounds": 3,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z",
+            "artifacts": [],
+            "history": [],
+        }
+        task = Task.from_dict(legacy)
+        self.assertEqual(task.progress, 100)
+        self.assertEqual(task.stage, "cancelled")
+        self.assertIsNone(task.activeClient)
+
+    def test_from_dict_legacy_created_derives_fields(self):
+        legacy = {
+            "id": "task_legacy6",
+            "projectId": "proj1",
+            "projectPath": "/test",
+            "title": "Legacy Created Task",
+            "description": "No new fields",
+            "acceptance": "",
+            "testCommand": "",
+            "status": "CREATED",
+            "round": 1,
+            "maxRounds": 3,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z",
+            "artifacts": [],
+            "history": [],
+        }
+        task = Task.from_dict(legacy)
+        self.assertEqual(task.progress, 0)
+        self.assertEqual(task.stage, "created")
+        self.assertIsNone(task.activeClient)
+
+    def test_from_dict_preserves_explicit_fields_when_present(self):
+        data = {
+            "id": "task_explicit1",
+            "projectId": "proj1",
+            "projectPath": "/test",
+            "title": "Explicit Task",
+            "description": "Has new fields",
+            "acceptance": "",
+            "testCommand": "",
+            "status": "CLAUDE_WINDOW_STARTED",
+            "round": 1,
+            "maxRounds": 3,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z",
+            "artifacts": [],
+            "history": [],
+            "progress": 45,
+            "stage": "custom_stage",
+            "activeClient": "claude",
+            "lastActivityAt": "2026-01-01T12:00:00Z",
+        }
+        task = Task.from_dict(data)
+        self.assertEqual(task.progress, 45)
+        self.assertEqual(task.stage, "custom_stage")
+        self.assertEqual(task.activeClient, "claude")
+        self.assertEqual(task.lastActivityAt, "2026-01-01T12:00:00Z")
+
+    def test_codex_completion_review_pass_clears_active_client(self):
+        _root, _project, project_store, task_store = self.make_project_store()
+        task = self.create_waiting_task(project_store, task_store)
+        task.status = "CODEX_WINDOW_STARTED"
+        task.progress = 60
+        task.stage = "codex_running"
+        task.activeClient = "codex"
+        task_store.save(task)
+        task_dir = task_store.task_dir(task.id)
+
+        marker_path = task_dir / f"codex_output_started_round_{task.round}.txt"
+        marker_path.write_text(str(time.time() - 120), encoding="utf-8")
+        time.sleep(0.1)
+        review_path = task_dir / "CODEX_REVIEW.json"
+        review_path.write_text(
+            json.dumps({"status": "PASS", "reviewed_at": "2026-01-01T00:00:00Z", "findings": []}),
+            encoding="utf-8",
+        )
+
+        updated = server.complete_codex_task(task.id, project_store, task_store)
+
+        self.assertEqual(updated.status, "PASS")
+        self.assertEqual(updated.progress, 100)
+        self.assertEqual(updated.stage, "review_complete")
+        self.assertIsNone(updated.activeClient)
+        self.assertIsNotNone(updated.lastActivityAt)
+
+
+def utc_now():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def fake_directory_rename(source, destination):

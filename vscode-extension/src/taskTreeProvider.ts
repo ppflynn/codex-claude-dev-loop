@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import { fetchTasks, resolveProject, ApiError } from './apiClient';
 import type { Task, Project } from './types';
-import { STATUS_ICONS } from './types';
+import { STATUS_ICONS, STATUS_LABELS } from './types';
 
 class TaskTreeItem extends vscode.TreeItem {
   constructor(
@@ -11,12 +11,35 @@ class TaskTreeItem extends vscode.TreeItem {
     collapsibleState: vscode.TreeItemCollapsibleState
   ) {
     super(task.title, collapsibleState);
-    this.description = `R ${task.round}/${task.maxRounds}  [${task.status}]`;
-    this.tooltip = `${task.title}\nStatus: ${task.status}\nRound: ${task.round}/${task.maxRounds}\nProject: ${project.name}`;
+
+    const parts: string[] = [];
+    parts.push(`R ${task.round}/${task.maxRounds}`);
+    parts.push(STATUS_LABELS[task.status] || task.status);
+    if (task.activeClient) {
+      parts.push(task.activeClient);
+    }
+    this.description = parts.join('  ');
+
+    const tooltipLines: string[] = [
+      `Title: ${task.title}`,
+      `Status: ${STATUS_LABELS[task.status] || task.status}`,
+      `Round: ${task.round}/${task.maxRounds}`,
+      `Progress: ${task.progress != null ? task.progress + '%' : 'N/A'}`,
+      `Stage: ${task.stage || 'N/A'}`,
+      `Project: ${project.name}`,
+    ];
+    if (task.activeClient) {
+      tooltipLines.push(`Running: ${task.activeClient}`);
+    }
+    if (task.lastActivityAt) {
+      tooltipLines.push(`Updated: ${task.lastActivityAt}`);
+    }
+    this.tooltip = tooltipLines.join('\n');
     this.contextValue = 'taskItem';
     this.resourceUri = vscode.Uri.file(task.projectPath);
 
-    const icon = STATUS_ICONS[task.status] || 'circle-outline';
+    const isRunning = task.status === 'CLAUDE_WINDOW_STARTED' || task.status === 'CODEX_WINDOW_STARTED';
+    const icon = isRunning ? 'sync~spin' : (STATUS_ICONS[task.status] || 'circle-outline');
     this.iconPath = new vscode.ThemeIcon(icon);
   }
 }

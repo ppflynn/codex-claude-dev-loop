@@ -11,14 +11,32 @@ const state = {
 const taskStatusLabels = {
   CREATED: "已创建",
   WAITING_FOR_CLAUDE: "等待 Claude",
-  CLAUDE_WINDOW_STARTED: "Claude 窗口已启动",
+  CLAUDE_WINDOW_STARTED: "Claude 运行中",
   WAITING_FOR_CODEX: "等待 Codex",
-  CODEX_WINDOW_STARTED: "Codex 窗口已启动",
+  CODEX_WINDOW_STARTED: "Codex 运行中",
   NEEDS_FIX: "需要修复",
   PASS: "通过",
   BLOCKED: "阻塞",
   FAILED: "失败",
   CANCELLED: "已取消",
+};
+
+const clientLabels = {
+  claude: "Claude",
+  codex: "Codex",
+};
+
+const stageLabels = {
+  created: "已创建",
+  claude_running: "Claude 实现中",
+  waiting_for_codex: "等待 Codex 审查",
+  codex_running: "Codex 审查中",
+  no_changes: "无改动",
+  review_complete: "审查完成",
+  review_invalid: "审查无效",
+  max_rounds_exhausted: "已达最大轮次",
+  cancelled: "已取消",
+  git_collection_failed: "Git 收集失败",
 };
 
 const terminalStatuses = new Set(["PASS", "BLOCKED", "FAILED", "CANCELLED"]);
@@ -221,12 +239,27 @@ function renderTasks() {
     state.tasks.forEach((task) => {
       const button = document.createElement("button");
       button.type = "button";
-      button.className = `project-item ${task.id === state.selectedTaskId ? "active" : ""}`;
+      const isRunning = runningTaskStatuses.has(task.status);
+      button.className = `project-item ${task.id === state.selectedTaskId ? "active" : ""} ${isRunning ? "task-running" : ""}`;
       button.onclick = () => selectTask(task.id);
 
       const title = document.createElement("div");
       title.className = "project-title";
-      title.innerHTML = `<span>${escapeHtml(task.title)}</span><span class="kind-pill">${taskBadge(task)}</span>`;
+      const titleSpan = document.createElement("span");
+      titleSpan.textContent = task.title;
+      const pillGroup = document.createElement("span");
+      pillGroup.className = "pill-group";
+      const statusPill = document.createElement("span");
+      statusPill.className = `kind-pill ${statusClass(task.status)}`;
+      statusPill.textContent = taskBadge(task);
+      pillGroup.appendChild(statusPill);
+      if (task.activeClient) {
+        const clientPill = document.createElement("span");
+        clientPill.className = "kind-pill client-pill";
+        clientPill.textContent = clientLabels[task.activeClient] || task.activeClient;
+        pillGroup.appendChild(clientPill);
+      }
+      title.append(titleSpan, pillGroup);
 
       const path = document.createElement("div");
       path.className = "project-path";
@@ -237,6 +270,17 @@ function renderTasks() {
       meta.textContent = taskMeta(task);
 
       button.append(title, path, meta);
+
+      if (task.progress != null && task.progress > 0 && !terminalStatuses.has(task.status)) {
+        const bar = document.createElement("div");
+        bar.className = "progress-bar";
+        const fill = document.createElement("div");
+        fill.className = "progress-fill";
+        fill.style.width = `${Math.min(100, Math.max(0, task.progress))}%`;
+        bar.appendChild(fill);
+        button.appendChild(bar);
+      }
+
       list.appendChild(button);
     });
   }
@@ -271,7 +315,27 @@ function taskBadge(task) {
 function taskMeta(task) {
   if (state.taskView === "archived") return `归档：${task.archivedAt || "-"}`;
   if (state.taskView === "trash") return `移入：${task.deletedAt || "-"}`;
-  return `轮次 ${task.round}/${task.maxRounds}`;
+  const parts = [];
+  parts.push(`轮次 ${task.round}/${task.maxRounds}`);
+  if (task.activeClient) {
+    parts.push(clientLabels[task.activeClient] || task.activeClient);
+  }
+  if (task.progress != null) {
+    parts.push(`进度 ${task.progress}%`);
+  }
+  if (task.lastActivityAt) {
+    parts.push(formatTime(task.lastActivityAt));
+  }
+  return parts.join("  ·  ");
+}
+
+function formatTime(iso) {
+  if (!iso) return "-";
+  try {
+    return new Date(iso).toLocaleString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  } catch {
+    return iso;
+  }
 }
 
 async function selectTask(id) {
@@ -292,6 +356,27 @@ function renderTaskDetails() {
   $("task-round").textContent = task ? `${task.round}` : "-";
   $("task-max-rounds").textContent = task ? `${task.maxRounds}` : "-";
   $("task-created").textContent = task?.createdAt || "-";
+  $("task-updated").textContent = task?.lastActivityAt || task?.updatedAt || "-";
+
+  const stageLabel = task?.stage ? (stageLabels[task.stage] || task.stage) : "-";
+  $("task-stage-label").textContent = stageLabel;
+
+  const progress = task?.progress != null ? `${task.progress}%` : "-";
+  $("task-progress-label").textContent = progress;
+  $("task-progress-container").style.display = task && task.progress != null ? "block" : "none";
+  const fill = $("task-progress-fill");
+  if (task && task.progress != null) {
+    fill.style.width = `${Math.min(100, Math.max(0, task.progress))}%`;
+  }
+
+  const clientText = task?.activeClient ? (clientLabels[task.activeClient] || task.activeClient) : "-";
+  $("task-active-client").textContent = clientText;
+
+  if (task && task.activeClient && runningTaskStatuses.has(task.status)) {
+    $("task-active-client").className = "task-detail-value client-running";
+  } else {
+    $("task-active-client").className = "task-detail-value";
+  }
 
   const history = $("task-history");
   history.textContent = task?.history?.length
