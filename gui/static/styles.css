@@ -668,3 +668,47 @@ textarea:focus {
 .toast.show {
   opacity: 1;
 }
+
+.progress-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--line);
+  overflow: hidden;
+  margin-top: 6px;
+}
+
+.progress-fill {
+  height: 100%;
+  border-radius: 3px;
+  background: var(--primary);
+  transition: width 300ms ease;
+}
+
+.project-item.task-running {
+  border-left: 3px solid var(--focus);
+}
+
+.client-pill {
+  background: #e8f4ff;
+  color: var(--focus);
+  font-weight: 650;
+}
+
+.task-detail-value.client-running {
+  color: var(--focus);
+  font-weight: 650;
+}
+
+@keyframes pulse-running {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+.task-detail-value.client-running::after {
+  content: " ●";
+  animation: pulse-running 1.2s ease-in-out infinite;
+}
+
+.status-pill.running {
+  animation: pulse-running 1.5s ease-in-out infinite;
+}

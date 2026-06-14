@@ -2,7 +2,8 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import { TaskTreeProvider } from './taskTreeProvider';
 import { createTaskCommand } from './createTaskCommand';
-import { fetchTaskArtifacts, fetchTasks, ApiError } from './apiClient';
+import { fetchTaskDetail, fetchTaskArtifacts, fetchTasks, ApiError } from './apiClient';
+import { STATUS_LABELS } from './types';
 import type { Task, Project } from './types';
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -112,6 +113,65 @@ export function activate(context: vscode.ExtensionContext): void {
         }
         const reportPath = path.join(taskItem.task.projectPath, 'docs', 'IMPLEMENTATION_REPORT.md');
         await openFile(reportPath);
+      }
+    )
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      'codexClaudeDevLoop.openTaskDetail',
+      async (taskItem?: { task: Task; project: Project }) => {
+        if (!taskItem) {
+          vscode.window.showWarningMessage('Select a task first.');
+          return;
+        }
+        try {
+          const task = await fetchTaskDetail(taskItem.task.id);
+          const statusLabel = STATUS_LABELS[task.status] || task.status;
+          const content = [
+            `# Task Detail: ${task.title}`,
+            '',
+            `| Field | Value |`,
+            `|-------|-------|`,
+            `| ID | ${task.id} |`,
+            `| Status | ${statusLabel} |`,
+            `| Round | ${task.round}/${task.maxRounds} |`,
+            `| Progress | ${task.progress != null ? task.progress + '%' : 'N/A'} |`,
+            `| Stage | ${task.stage || 'N/A'} |`,
+            `| Active Client | ${task.activeClient || 'None'} |`,
+            `| Created | ${task.createdAt} |`,
+            `| Updated | ${task.lastActivityAt || task.updatedAt} |`,
+            `| Project | ${task.projectPath} |`,
+            '',
+            '## Description',
+            '',
+            task.description,
+            '',
+            '## Acceptance Criteria',
+            '',
+            task.acceptance || 'None',
+            '',
+            '---',
+            '',
+            '## History',
+            '',
+            ...(task.history || []).map(
+              (h) => `- \`[${h.at}]\` **${h.event}**: ${h.message}`
+            ),
+          ].join('\n');
+
+          const doc = await vscode.workspace.openTextDocument({
+            content,
+            language: 'markdown',
+          });
+          await vscode.window.showTextDocument(doc, { preview: false });
+        } catch (err: unknown) {
+          if (err instanceof ApiError) {
+            vscode.window.showErrorMessage(`Failed to fetch task detail: ${err.message}`);
+          } else {
+            vscode.window.showErrorMessage(`Failed to fetch task detail: ${String(err)}`);
+          }
+        }
       }
     )
   );
