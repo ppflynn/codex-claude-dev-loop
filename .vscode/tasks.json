@@ -78,7 +78,7 @@
         "-File",
         "${workspaceFolder}/scripts/start-gui.ps1",
         "-Port",
-        "8787"
+        "8765"
       ],
       "presentation": {
         "reveal": "always",
