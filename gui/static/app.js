@@ -47,6 +47,109 @@ const terminalConnections = {
   codex: { source: null, done: false, subKey: null, reconnectTimer: null, reconnectDelay: 1000 },
 };
 
+// xterm.js terminal instances
+const VSCodeTerminalTheme = {
+  background: "#1e1e1e",
+  foreground: "#cccccc",
+  cursor: "#ffffff",
+  selectionBackground: "#264f78",
+  black: "#000000",
+  red: "#cd3131",
+  green: "#0dbc79",
+  yellow: "#e5e510",
+  blue: "#2472c8",
+  magenta: "#bc3fbc",
+  cyan: "#11a8cd",
+  white: "#e5e5e5",
+  brightBlack: "#666666",
+  brightRed: "#f14c4c",
+  brightGreen: "#23d18b",
+  brightYellow: "#f5f543",
+  brightBlue: "#3b8eea",
+  brightMagenta: "#d670d6",
+  brightCyan: "#29b8db",
+  brightWhite: "#ffffff",
+};
+
+const terminalInstances = {
+  claude: { term: null, fitAddon: null, observer: null, hasOutput: false },
+  codex: { term: null, fitAddon: null, observer: null, hasOutput: false },
+};
+
+function createTerminal(client) {
+  destroyTerminal(client);
+  const container = document.getElementById(`${client}-output`);
+  if (!container) return null;
+
+  container.innerHTML = "";
+
+  const term = new Terminal({
+    theme: VSCodeTerminalTheme,
+    fontSize: 13,
+    fontFamily: 'Consolas, "Cascadia Mono", "Microsoft YaHei UI", monospace',
+    allowProposedApi: true,
+    cursorBlink: false,
+    disableStdin: true,
+    scrollback: 10000,
+    convertEol: true,
+  });
+
+  const FitAddonCtor = window.FitAddon?.FitAddon || window.FitAddon;
+  const fitAddon = new FitAddonCtor();
+  term.loadAddon(fitAddon);
+  term.open(container);
+
+  const observer = new ResizeObserver(() => {
+    try { fitAddon.fit(); } catch (_e) { /* ignore */ }
+  });
+  observer.observe(container);
+
+  terminalInstances[client] = { term, fitAddon, observer, hasOutput: false };
+  return term;
+}
+
+function destroyTerminal(client) {
+  const inst = terminalInstances[client];
+  if (inst.observer) {
+    inst.observer.disconnect();
+    inst.observer = null;
+  }
+  if (inst.term) {
+    inst.term.dispose();
+    inst.term = null;
+  }
+  inst.fitAddon = null;
+  inst.hasOutput = false;
+}
+
+function destroyAllTerminals() {
+  destroyTerminal("claude");
+  destroyTerminal("codex");
+}
+
+function writeToTerminal(client, text) {
+  const term = terminalInstances[client].term;
+  if (term) {
+    term.write(text);
+  }
+}
+
+function clearAndWriteTerminal(client, text) {
+  const term = terminalInstances[client].term;
+  if (term) {
+    term.reset();
+    if (text) term.write(text);
+  }
+}
+
+function writeTerminalPlaceholder(client, text) {
+  const term = terminalInstances[client].term;
+  if (term) {
+    term.reset();
+    term.write("\x1b[2m" + text + "\x1b[0m\r\n");
+  }
+}
+
 function connectTerminal(client) {
   disconnectTerminal(client);
   const task = selectedTask();
@@ -55,11 +158,11 @@ function connectTerminal(client) {
   const taskId = task.id;
   const taskRound = task.round;
 
-  const outputEl = document.getElementById(`${client}-output`);
-  if (!outputEl) return;
-  outputEl.textContent = "正在连接...";
+  const term = createTerminal(client);
+  if (!term) return;
+  term.write("\x1b[2m正在连接...\x1b[0m\r\n");
   terminalConnections[client].done = false;
-  terminalConnections[client].hasOutput = false;
+  terminalInstances[client].hasOutput = false;
   updateTerminalBadges();
 
   const es = new EventSource(`/api/tasks/${taskId}/terminal/${client}/stream`);
@@ -75,19 +178,18 @@ function connectTerminal(client) {
     try {
       const data = JSON.parse(event.data);
       if (data.waiting) {
-        if (!terminalConnections[client].hasOutput) {
-          outputEl.textContent = "等待 CLI 启动并创建日志文件...";
+        if (!terminalInstances[client].hasOutput) {
+          term.reset();
+          term.write("\x1b[2m等待 CLI 启动并创建日志文件...\x1b[0m\r\n");
         }
       }
       if (data.chunk) {
         terminalConnections[client].reconnectDelay = 1000;
-        if (!terminalConnections[client].hasOutput) {
-          outputEl.textContent = data.chunk;
-          terminalConnections[client].hasOutput = true;
-        } else {
-          outputEl.textContent += data.chunk;
+        if (!terminalInstances[client].hasOutput) {
+          term.reset();
+          terminalInstances[client].hasOutput = true;
         }
-        outputEl.scrollTop = outputEl.scrollHeight;
+        term.write(data.chunk);
       }
       if (data.done) {
         if (terminalConnections[client].source === es) {
@@ -217,8 +319,8 @@ function updateClientTitleBadge(client, task) {
 }
 
 async function loadTerminalContent(client, taskId, taskRound) {
-  const outputEl = document.getElementById(`${client}-output`);
-  if (!outputEl) return;
+  const term = createTerminal(client);
+  if (!term) return;
 
   try {
     const meta = await api(`/api/tasks/${taskId}/terminal/${client}`);
@@ -226,7 +328,7 @@ async function loadTerminalContent(client, taskId, taskRound) {
     if (!current || current.id !== taskId || current.round !== taskRound) return;
 
     if (!meta.exists) {
-      outputEl.textContent = `（${client === "claude" ? "Claude" : "Codex"} CLI 尚未启动或日志文件不存在。）`;
+      term.write("\x1b[2m（" + (client === "claude" ? "Claude" : "Codex") + " CLI 尚未启动或日志文件不存在。）\x1b[0m\r\n");
       return;
     }
     const artifacts = await api(`/api/tasks/${taskId}/artifacts`);
@@ -235,12 +337,13 @@ async function loadTerminalContent(client, taskId, taskRound) {
 
     const logName = meta.logName;
     if (artifacts.artifacts && artifacts.artifacts[logName] && artifacts.artifacts[logName].exists) {
-      outputEl.textContent = artifacts.artifacts[logName].content;
+      term.write(artifacts.artifacts[logName].content);
     }
+    terminalInstances[client].hasOutput = true;
   } catch (_e) {
     const current = selectedTask();
     if (!current || current.id !== taskId || current.round !== taskRound) return;
-    outputEl.textContent = `（无法读取 ${client === "claude" ? "Claude" : "Codex"} 终端输出。）`;
+    term.write("\x1b[2m（无法读取 " + (client === "claude" ? "Claude" : "Codex") + " 终端输出。）\x1b[0m\r\n");
   }
 }
 
@@ -249,9 +352,6 @@ function refreshTerminalsForTask() {
   const taskId = task?.id ?? null;
   const taskRound = task?.round ?? null;
 
-  // Build subscription keys: skip disconnect/reconnect if nothing changed
-  // Include activeClient so that terminal panels refresh when the active client
-  // changes or is corrected by a poll while the task status stays the same.
   const claudeKey = task ? `${task.id}|${task.round}|claude|${task.status}|${task.activeClient ?? ""}` : null;
   const codexKey = task ? `${task.id}|${task.round}|codex|${task.status}|${task.activeClient ?? ""}` : null;
   if (claudeKey === terminalConnections.claude.subKey && codexKey === terminalConnections.codex.subKey) {
@@ -261,13 +361,17 @@ function refreshTerminalsForTask() {
   terminalConnections.codex.subKey = codexKey;
 
   disconnectAllTerminals();
+  destroyAllTerminals();
 
-  // Reset both panels to current-task placeholder (never retain old task output)
+  // Create fresh terminals with placeholder
   const placeholder = task
     ? `任务 ${taskId} 轮次 ${taskRound} — 等待终端输出...`
     : "选择运行中的任务以查看终端输出。";
-  document.getElementById("claude-output").textContent = placeholder;
-  document.getElementById("codex-output").textContent = placeholder;
+
+  const claudeTerm = createTerminal("claude");
+  const codexTerm = createTerminal("codex");
+  if (claudeTerm) writeTerminalPlaceholder("claude", placeholder);
+  if (codexTerm) writeTerminalPlaceholder("codex", placeholder);
 
   if (!task) {
     updateTerminalBadges();
@@ -275,7 +379,6 @@ function refreshTerminalsForTask() {
   }
 
   if (runningTaskStatuses.has(task.status)) {
-    // Stream for active client, load existing log for inactive client
     const claudeActive = task.activeClient === "claude" || task.status === "CLAUDE_WINDOW_STARTED";
     const codexActive = task.activeClient === "codex" || task.status === "CODEX_WINDOW_STARTED";
     if (claudeActive) connectTerminal("claude"); else loadTerminalContent("claude", taskId, taskRound);
@@ -707,6 +810,9 @@ async function setTaskView(view) {
   localStorage.setItem("taskView", view);
   localStorage.removeItem("selectedTaskId");
   disconnectAllTerminals();
+  destroyAllTerminals();
+  terminalConnections.claude.subKey = null;
+  terminalConnections.codex.subKey = null;
   await loadTasks();
 }
 

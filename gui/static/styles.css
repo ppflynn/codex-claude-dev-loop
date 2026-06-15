@@ -13,6 +13,12 @@
   --focus: #2a7de1;
   --code: #111820;
   --code-line: #253241;
+  /* VSCode terminal colours */
+  --term-bg: #1e1e1e;
+  --term-header: #252526;
+  --term-tab-active: #1e1e1e;
+  --term-tab-inactive: #2d2d2d;
+  --term-tab-border: #252526;
 }
 
 * {
@@ -447,7 +453,7 @@ textarea:focus {
 
 .inspector {
   display: grid;
-  grid-template-rows: auto minmax(180px, 0.6fr) minmax(140px, 0.7fr) minmax(140px, 0.8fr);
+  grid-template-rows: auto minmax(200px, 0.55fr) minmax(140px, 0.65fr) minmax(140px, 0.8fr);
   gap: 12px;
   padding: 12px;
 }
@@ -545,41 +551,60 @@ textarea:focus {
   word-break: break-word;
 }
 
+/* ---- xterm terminal panel ---- */
+
+.runtime-terminal-panel {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  padding: 12px;
+  display: grid;
+  grid-template-rows: auto 1fr;
+}
+
+.runtime-terminal-panel .panel-heading {
+  margin-bottom: 6px;
+}
+
 .terminal-grid {
   display: grid;
   grid-template-rows: 1fr 1fr;
-  gap: 8px;
-  height: calc(100% - 52px);
+  gap: 2px;
   min-height: 120px;
+  border: 1px solid var(--term-tab-border);
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--term-tab-border);
 }
 
 .terminal-box {
   display: grid;
   grid-template-rows: auto 1fr;
   min-height: 0;
-  border: 1px solid var(--code-line);
-  border-radius: 8px;
-  overflow: hidden;
-  background: var(--code);
+  background: var(--term-bg);
+}
+
+.terminal-box:first-child {
+  border-bottom: 1px solid var(--term-tab-border);
 }
 
 .terminal-title {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 6px 10px;
-  border-bottom: 1px solid var(--code-line);
-  background: #17212c;
-  color: #b9c6d2;
+  padding: 4px 12px;
+  background: var(--term-tab-active);
+  color: #cccccc;
   font-size: 12px;
+  user-select: none;
 }
 
 .terminal-title .terminal-client-badge {
   font-size: 11px;
   padding: 1px 7px;
   border-radius: 999px;
-  background: #253241;
-  color: #8999ab;
+  background: #3c3c3c;
+  color: #cccccc;
 }
 
 .terminal-title .terminal-client-badge.active {
@@ -587,18 +612,18 @@ textarea:focus {
   color: #fff;
 }
 
-#claude-output,
-#codex-output {
-  margin: 0;
-  overflow: auto;
-  background: var(--code);
-  color: #dce7f0;
-  padding: 10px;
-  line-height: 1.45;
-  font-family: Consolas, "Cascadia Mono", monospace;
-  font-size: 12px;
-  white-space: pre-wrap;
+/* xterm container fills the remaining terminal-box space */
+.terminal-output {
+  min-height: 0;
+  overflow: hidden;
 }
+
+.terminal-output .xterm {
+  height: 100%;
+  padding: 2px 0 2px 8px;
+}
+
+/* ---- task history & artifact panels ---- */
 
 #task-history,
 #artifact-content {
@@ -611,17 +636,6 @@ textarea:focus {
   font-family: Consolas, "Cascadia Mono", monospace;
   font-size: 12px;
   white-space: pre-wrap;
-}
-
-.runtime-terminal-panel {
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--panel);
-  padding: 12px;
-}
-
-.runtime-terminal-panel .panel-heading {
-  margin-bottom: 6px;
 }
 
 #task-history {

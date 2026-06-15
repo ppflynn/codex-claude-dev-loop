@@ -4,6 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Agent 协同控制台</title>
+    <link rel="stylesheet" href="/xterm/xterm.css">
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
@@ -160,12 +161,18 @@
           </div>
           <div class="terminal-grid" id="terminal-grid">
             <div class="terminal-box" id="claude-terminal-box">
-              <div class="terminal-title">Claude CLI</div>
-              <pre id="claude-output" class="terminal-output">选择运行中的任务以查看终端输出。</pre>
+              <div class="terminal-title">
+                <span>Claude CLI</span>
+                <span></span>
+              </div>
+              <div id="claude-output" class="terminal-output"></div>
             </div>
             <div class="terminal-box" id="codex-terminal-box">
-              <div class="terminal-title">Codex CLI</div>
-              <pre id="codex-output" class="terminal-output">选择运行中的任务以查看终端输出。</pre>
+              <div class="terminal-title">
+                <span>Codex CLI</span>
+                <span></span>
+              </div>
+              <div id="codex-output" class="terminal-output"></div>
             </div>
           </div>
         </section>
@@ -200,6 +207,8 @@
     </main>
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="/xterm/xterm.js"></script>
+    <script src="/xterm/xterm-addon-fit.js"></script>
     <script src="/app.js"></script>
   </body>
 </html>

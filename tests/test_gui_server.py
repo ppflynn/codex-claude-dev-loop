@@ -734,23 +734,34 @@ class TerminalApiTests(unittest.TestCase):
         meta = server._terminal_metadata(task_store, task, "claude")
         self.assertEqual(meta["client"], "claude")
         self.assertEqual(meta["taskId"], "task_termtest")
+        self.assertEqual(meta["round"], 1)
+        self.assertEqual(meta["status"], "CREATED")
+        self.assertFalse(meta["active"])
         self.assertFalse(meta["exists"])
         self.assertEqual(meta["size"], 0)
+        self.assertIsNone(meta["updatedAt"])
 
     def test_terminal_metadata_for_existing_log(self):
         _root, task_store, task = self.make_store_and_task()
         log_path = task_store.task_dir(task.id) / "claude_window_round_1.log"
         log_path.write_text("Hello from Claude\n", encoding="utf-8")
+        task.status = Status.CLAUDE_WINDOW_STARTED
+        task.activeClient = "claude"
         meta = server._terminal_metadata(task_store, task, "claude")
         self.assertTrue(meta["exists"])
         self.assertGreater(meta["size"], 0)
         self.assertEqual(meta["logName"], "claude_window_round_1.log")
+        self.assertEqual(meta["round"], 1)
+        self.assertEqual(meta["status"], "CLAUDE_WINDOW_STARTED")
+        self.assertTrue(meta["active"])
+        self.assertIsNotNone(meta["updatedAt"])
 
     def test_terminal_metadata_uses_task_round(self):
         _root, task_store, task = self.make_store_and_task()
         task.round = 3
         meta = server._terminal_metadata(task_store, task, "codex")
         self.assertEqual(meta["logName"], "codex_window_round_3.log")
+        self.assertEqual(meta["round"], 3)
 
     def test_terminal_api_endpoint_missing_task_returns_404(self):
         handler = _make_handler("GET", "/api/tasks/task_nonexistent/terminal/claude")
@@ -796,6 +807,20 @@ class TerminalApiTests(unittest.TestCase):
             self.assertTrue(body["exists"])
             self.assertEqual(body["client"], "claude")
             self.assertEqual(body["logName"], "claude_window_round_1.log")
+            self.assertEqual(body["round"], 1)
+            self.assertEqual(body["status"], "CREATED")
+            self.assertFalse(body["active"])
+            self.assertIsNotNone(body["updatedAt"])
+
+    def test_terminal_metadata_active_client_reflects_running_state(self):
+        """Active flag should be true only for the client matching activeClient in running status."""
+        _root, task_store, task = self.make_store_and_task()
+        task.status = Status.CLAUDE_WINDOW_STARTED
+        task.activeClient = "claude"
+        claude_meta = server._terminal_metadata(task_store, task, "claude")
+        codex_meta = server._terminal_metadata(task_store, task, "codex")
+        self.assertTrue(claude_meta["active"])
+        self.assertFalse(codex_meta["active"])
 
     def test_terminal_stream_captured_round_survives_round_advance(self):
         """P2-1 regression: stream must keep reading original round log after task.round advances."""
