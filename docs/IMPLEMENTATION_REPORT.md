@@ -324,3 +324,134 @@ py -3 -m pytest tests/test_gui_server.py tests/test_cli_window.py -q
 py -3 -m pytest -q
 121 passed, 4 warnings in 17.90s
 ```
+
+## Round 10: xterm.js Terminal Upgrade & VSCode Workbench Layout
+
+### Summary
+
+Replaced the plain `<pre>`-based terminal display with xterm.js (v5.3.0) rendering. Each CLI client (Claude/Codex) now has an independent xterm Terminal instance with VSCode Terminal dark theme. The existing SSE log streaming, task state machine, and PowerShell CLI window launching are untouched. No web command input capability is added.
+
+### xterm.js Asset Management
+
+- Downloaded xterm v5.3.0 and xterm-addon-fit v0.7.0 UMD bundles locally via npm
+- Copied to `gui/static/xterm/` directory:
+  - `xterm.js` — UMD bundle exposing `window.Terminal`
+  - `xterm.css` — base xterm stylesheet
+  - `xterm-addon-fit.js` — UMD bundle exposing `window.FitAddon`
+- Loaded via `<script>` tags in `index.html`; no CDN dependencies
+
+### Frontend Architecture Changes
+
+**Terminal lifecycle** (`gui/static/app.js`):
+
+- `terminalInstances` object stores per-client `{ term, fitAddon, observer, hasOutput }` state
+- `createTerminal(client)` — Creates a new xterm Terminal with VSCode dark theme options (`fontSize: 13`, `scrollback: 10000`, `disableStdin: true`, `convertEol: true`), attaches `FitAddon`, opens in the container DOM element, and sets up a `ResizeObserver` for auto-fit on container resize. Destroys any existing terminal first.
+- `destroyTerminal(client)` — Disconnects the ResizeObserver, calls `term.dispose()`, and nulls out references.
+- `writeToTerminal(client, text)` — Writes text directly to the xterm instance via `term.write()`.
+- `clearAndWriteTerminal(client, text)` — Resets the terminal (clears buffer and viewport) then writes text.
+- `writeTerminalPlaceholder(client, text)` — Resets terminal and writes dimmed placeholder text using ANSI escape `\x1b[2m`.
+- `destroyAllTerminals()` — Destroys both terminals (called on task view switch).
+
+**Modified functions**:
+
+- `connectTerminal(client)` — Creates a fresh xterm instance via `createTerminal()`, writes dimmed `"正在连接..."` placeholder, then streams SSE chunks with `term.write(data.chunk)`. On first real chunk, calls `term.reset()` to clear the placeholder. All existing stale-guard, reconnect, and `subKey` logic preserved.
+- `loadTerminalContent(client, taskId, taskRound)` — Creates a fresh xterm instance, writes dimmed placeholder for missing logs, or writes full historical content via `term.write()` for existing logs. Post-await identity verification preserved.
+- `refreshTerminalsForTask()` — Destroys all old terminals, creates fresh ones with dimmed placeholder text, then either connects SSE streams or loads static content. Subscription key logic preserved.
+- `setTaskView()` — Now calls `destroyAllTerminals()` in addition to `disconnectAllTerminals()`.
+
+### HTML Changes
+
+- Replaced `<pre id="claude-output" class="terminal-output">` with `<div id="claude-output" class="terminal-output">`
+- Replaced `<pre id="codex-output" class="terminal-output">` with `<div id="codex-output" class="terminal-output">`
+- Added `<link rel="stylesheet" href="/xterm/xterm.css">` in `<head>`
+- Added `<script src="/xterm/xterm.js">` and `<script src="/xterm/xterm-addon-fit.js">` before `</body>`
+
+### CSS Changes
+
+- Removed old `<pre>`-specific terminal box styles
+- Added `--term-bg`, `--term-header`, `--term-tab-active`, `--term-tab-inactive`, `--term-tab-border` CSS variables for VSCode-like dark theme
+- Terminal grid now uses `background: var(--term-tab-border)` as separator between stacked terminals
+- Terminal box uses `background: var(--term-bg)` (#1e1e1e — VSCode terminal background)
+- Terminal title bar restyled: `background: var(--term-tab-active)` (#252526), light text
+- Updated `runtime-terminal-panel` to use `display: grid; grid-template-rows: auto 1fr` for proper sizing
+- `.terminal-output` set to `min-height: 0; overflow: hidden` so xterm fills space correctly
+- `.terminal-output .xterm` gets left padding for visual comfort
+- Inspector grid row adjusted: `minmax(200px, 0.55fr)` for terminal panel
+
+### Backend Enhancement
+
+- `_terminal_metadata()` now returns additional fields:
+  - `round` — current task round number
+  - `status` — current task status string
+  - `active` — boolean, true when this client is the task's activeClient and task is in a running status
+  - `updatedAt` — ISO 8601 timestamp of the log file's last modification, or null if log doesn't exist
+- Existing fields (`taskId`, `client`, `logName`, `exists`, `size`) preserved for backward compatibility
+- Added `from datetime import datetime, timezone` import
+
+### Test Changes
+
+- `test_terminal_metadata_for_missing_log` — Added assertions for `round`, `status`, `active` (false), `updatedAt` (null)
+- `test_terminal_metadata_for_existing_log` — Sets `CLAUDE_WINDOW_STARTED` status and `activeClient`, asserts `active` is true and `updatedAt` is not null
+- `test_terminal_metadata_uses_task_round` — Added assertion for `meta["round"] == 3`
+- `test_terminal_api_endpoint_returns_metadata` — Added assertions for `round`, `status`, `active`, `updatedAt`
+- `test_terminal_metadata_active_client_reflects_running_state` — New test verifying `active` flag is true only for the matching client in running status
+
+### Safety & Behavior Guarantees Preserved
+
+- Client parameter validation (`{"claude", "codex"}`) — unchanged
+- Log path safety via `ensure_child_path` — unchanged
+- Stale task guard (captures `taskId`/`taskRound`, verifies before every SSE write and after every `await` in `loadTerminalContent`) — preserved
+- Subscription key deduplication (`taskId|round|client|status|activeClient`) — preserved, prevents unnecessary reconnect/flicker
+- SSE reconnect with exponential backoff (1s → 30s max, reset on data chunk) — preserved
+- `subKey` clearing on SSE error to allow re-poll reconnect — preserved
+- `onerror` `wasCurrent` guard before scheduling reconnect — preserved
+- Incremental UTF-8 decoder in `_terminal_stream` — unchanged, ensures Chinese/multibyte output renders correctly in xterm
+- Stream round capture (log path frozen at stream start) — unchanged
+
+### Test Results
+
+```
+py -3 -m pytest tests/test_gui_server.py tests/test_cli_window.py -q
+48 passed, 1 warning in 3.64s
+```
+
+```
+py -3 -m pytest -q
+122 passed, 4 warnings in 16.21s
+```
+
+```
+cd vscode-extension && npm.cmd run compile
+(compiled cleanly, no errors)
+```
+
+```
+cd vscode-extension && npm.cmd test
+8 passing (3ms)
+```
+
+### Round 2 Fix: xterm.js Constructor & subKey Cleanup
+
+**P1-1** — The UMD bundle for `xterm-addon-fit` exposes the constructor as `window.FitAddon.FitAddon`, not `window.FitAddon`. Calling `new FitAddon()` threw `TypeError`, causing `createTerminal()` to fail and leaving both terminal panels empty (no xterm instances rendered).
+
+Fix in `gui/static/app.js:97`:
+```
+const FitAddonCtor = window.FitAddon?.FitAddon || window.FitAddon;
+const fitAddon = new FitAddonCtor();
+```
+This resolves the constructor defensively so the code works with both UMD module shapes.
+
+**P2-1** — `setTaskView()` called `destroyAllTerminals()` but did not clear `terminalConnections.*.subKey`. When `loadTasks()` subsequently triggered `refreshTerminalsForTask()` for the same task, the subKey matched and the function returned early without recreating terminals, leaving the panel empty.
+
+Fix in `gui/static/app.js:812` — clear both subKeys after destroying terminals:
+```
+terminalConnections.claude.subKey = null;
+terminalConnections.codex.subKey = null;
+```
+
+### Test Results (Round 2)
+
+```
+py -3 -m pytest tests/test_gui_server.py tests/test_cli_window.py -q
+48 passed, 1 warning in 3.62s
+```

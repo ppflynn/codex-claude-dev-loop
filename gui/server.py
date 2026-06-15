@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -884,12 +885,18 @@ def _terminal_metadata(task_store, task, client: str) -> dict[str, Any]:
     should_fallback = task.status == Status.WAITING_FOR_CLAUDE
     log_path = _resolve_terminal_log(task_store, task, client, fallback=should_fallback)
     exists = log_path.is_file()
+    active = (task.activeClient == client) and (task.status in RUNNING_TASK_STATUSES)
+    mtime = log_path.stat().st_mtime if exists else None
     return {
         "taskId": task.id,
         "client": client,
+        "round": task.round,
         "logName": log_path.name,
         "exists": exists,
         "size": log_path.stat().st_size if exists else 0,
+        "status": task.status,
+        "active": active,
+        "updatedAt": datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z") if mtime else None,
     }
 
 
