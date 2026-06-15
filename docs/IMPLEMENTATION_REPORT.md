@@ -455,3 +455,564 @@ terminalConnections.codex.subKey = null;
 py -3 -m pytest tests/test_gui_server.py tests/test_cli_window.py -q
 48 passed, 1 warning in 3.62s
 ```
+
+## Round 11: Terminal Layout & CLI Completion Awareness
+
+### Summary
+
+Improved terminal display area and added CLI completion detection with auto-refresh. The right-side inspector now allocates significantly more space to the runtime terminal panel. The backend parses `CLI exit code: N` from log files and exposes it in both the metadata API and SSE done events. The frontend displays exit status badges, prompts user to click completion buttons when the active client exits, and auto-refreshes task state every 4 seconds while tasks are running.
+
+### Terminal Layout Changes
+
+**Problem**: The `.inspector` grid allocated `minmax(200px, 0.55fr)` to the terminal row and gave more fractional space to the lower panels (0.65fr and 0.8fr). With two terminals stacked vertically (`1fr 1fr`), each xterm viewport got only ~5-6 lines at 13px font — barely usable.
+
+**Fix** (`gui/static/styles.css`):
+- Changed inspector grid rows to: `auto minmax(380px, 1.4fr) minmax(80px, 0.3fr) minmax(80px, 0.3fr)`
+  - Terminal row gets 1.4fr of the 2.0fr total = ~64% of remaining space after the auto-sized task status row
+  - On a 1080px viewport: each terminal gets ~17 lines; on 900px: ~13 lines
+  - Lower panels (task history, artifacts) get `minmax(80px, 0.3fr)` — smaller but with internal scrolling
+- `.terminal-grid` min-height increased from `120px` to `260px`
+- `.terminal-box` added `overflow: hidden` to prevent content overflow
+- Task history (`#task-history`) and artifact panels continue to scroll internally when content exceeds their area
+
+### CLI Completion Awareness
+
+**Backend** (`gui/server.py`):
+
+- `_terminal_metadata()` now reads the log file and scans for `CLI exit code: N` via regex. When found, returns `finished: true` and `exitCode: N` (integer). When the log doesn't exist or doesn't contain the sentinel, returns `finished: false` and `exitCode: null`. Also returns `lastLogUpdateAt` (ISO 8601 from log file mtime, same as `updatedAt`).
+- `_terminal_stream()` SSE done event now includes `exitCode` parsed from the `CLI exit code:` line. Uses the same `re.search(r"CLI exit code:\s*(-?\d+)")` pattern applied to the decoded chunk + tail buffer.
+
+**Frontend** (`gui/static/app.js`):
+
+- `terminalConnections` gains `finished`, `exitCode`, `lastLogUpdateAt` per client. These are cleared by `disconnectTerminal()`.
+- `updateClientTitleBadge()` now shows context-aware badges:
+  - "实时" (blue) — SSE stream active
+  - "已退出" (grey) — terminal finished with exit code 0
+  - "退出码 N" (yellow/warn) — terminal finished with non-zero exit code
+  - "运行中" (blue) — task is running, this is the active client
+  - "待启动" (grey) — no activity
+- `loadTerminalContent()` captures `finished`/`exitCode`/`lastLogUpdateAt` from metadata API response and updates connection state.
+- SSE `onmessage` done handler captures `data.exitCode` into connection state.
+- `showCompletionPrompt(client, taskId)` — when the active client's terminal finishes (SSE done or static load), checks if this client is still the task's active client in running status. If so, adds an `attention-pulse` glow animation to the corresponding completion button and shows a toast: "Claude CLI 已退出 (退出码 0)，请点击 "Claude 已完成" 推进任务".
+- `updateActionStates()` clears the `attention-pulse` class from completion buttons when they become disabled (task state changed).
+- New CSS classes: `.terminal-client-badge.warn` (yellow/warning background for non-zero exit codes), `.attention-pulse` (glow animation for the completion button).
+
+### Task Auto-Refresh
+
+**Problem**: The task list and details only updated on user action (selecting a task, clicking a button). Running task progress, status transitions, and terminal activity weren't reflected without manual interaction.
+
+**Fix** (`gui/static/app.js`):
+
+- `manageAutoRefresh()` starts a 4-second polling interval when:
+  - The task view is "active" (not archived or trash)
+  - Any task has a running status OR the selected task is in a running status
+- The interval calls `loadTasks(true)` (skip artifacts during auto-refresh to avoid unnecessary artifact re-fetch).
+- `loadTasks(skipArtifacts)` now accepts an optional parameter. During auto-refresh, artifacts are only reloaded when the task list actually changed (detected via composite ID comparison).
+- Auto-refresh stops when switching to archived/trash views or when no running tasks remain.
+- **Safety**: The `subKey` deduplication in `refreshTerminalsForTask()` prevents xterm recreation on every poll — terminals are only recreated when the task identity, round, status, or active client actually changes.
+
+### Tests
+
+**New tests** (`tests/test_gui_server.py`):
+
+| Test | Coverage |
+|---|---|
+| `test_terminal_metadata_parses_cli_exit_code_zero` | Metadata returns `finished=true, exitCode=0` when log contains `CLI exit code: 0` |
+| `test_terminal_metadata_parses_nonzero_exit_code` | Metadata returns `finished=true, exitCode=3` when log contains `CLI exit code: 3` |
+| `test_sse_done_event_includes_exit_code` | SSE stream emits `done: true, exitCode: 5` in the final event |
+
+**Updated existing tests**:
+- `test_terminal_metadata_for_missing_log` — asserts `finished=false, exitCode=null, lastLogUpdateAt=null`
+- `test_terminal_metadata_for_existing_log` — asserts `finished=false, exitCode=null` (no exit code in log), `lastLogUpdateAt` is not null
+
+### What Was NOT Changed
+
+- No web command input capability added (SSE and metadata remain read-only)
+- Task status is NOT automatically advanced — user must still click "Claude 已完成" / "Codex 已完成"
+- No automatic commits, pushes, or merges
+- PowerShell CLI window launching via `subprocess.Popen` preserved
+- All existing `subKey` deduplication, stale-guard, reconnect, and incremental UTF-8 decoder logic preserved
+- VS Code extension unchanged
+
+### Future Considerations
+
+The current architecture (PowerShell window + file-based SSE streaming) works for the current use case but has limitations:
+- The 500ms polling in `_terminal_stream` adds latency
+- No PTY/WebSocket for true real-time streaming
+- File-based logs require the PowerShell window to flush output (line-buffered or manual)
+
+**If real-time interaction is needed in the future:**
+- Replace the file-based approach with a WebSocket server that receives `subprocess.Popen` stdout directly
+- Or use a PTY (pseudo-terminal) with WebSocket relay for sub-100ms latency
+- Either approach would require significant architectural changes to both the launcher and the GUI server
+
+### Test Results
+
+```
+py -3 -m pytest tests/test_gui_server.py tests/test_cli_window.py -q
+51 passed, 1 warning in 3.71s
+```
+
+```
+py -3 -m pytest -q
+125 passed, 4 warnings in 16.75s
+```
+
+```
+cd vscode-extension && npm.cmd run compile
+(compiled cleanly, no errors)
+```
+
+```
+cd vscode-extension && npm.cmd test
+8 passing (4ms)
+```
+
+## Round 12: Sentinel Parsing Hardening (P2-1 Fix)
+
+### Summary
+
+Hardened the `CLI exit code: N` sentinel parsing in both `_terminal_metadata()` and `_terminal_stream()` to use anchored line matching (`^...$`) instead of unanchored regex search. This prevents false positives when Claude/Codex normal output contains the string `CLI exit code:` as embedded text, and handles the case where the sentinel line is split across file read boundaries in the SSE stream.
+
+### Root Cause (P2-1)
+
+The original SSE parser used a raw substring check `"CLI exit code:" in chunk` followed by unanchored `re.search(r"CLI exit code:\s*(-?\d+)", chunk + tail)`. This had two failure modes:
+
+1. **False positive**: If Claude/Codex output contained `CLI exit code:` in normal text (e.g., `"The CLI exit code: 5 was unexpected"`), the SSE stream would emit `done` with a wrong exit code and prompt the user while the CLI was still running.
+2. **Split-across-reads**: If the sentinel line `CLI exit code: 0\n` was split across two file poll cycles (e.g., `CLI exit ` + `code: 0\n`), the raw substring check would fire on the first half but the regex on the combined content might still work — however, the line-based approach is more robust.
+
+The metadata parser had the same unanchored search risk.
+
+### Changes
+
+**`gui/server.py` `_terminal_metadata()`**:
+- Changed from `re.search(r"CLI exit code:\s*(-?\d+)", content)` to scanning lines in reverse with `re.match(r"^CLI exit code:\s*(-?\d+)\s*$", line)`
+- Scanning from the end ensures the *last* sentinel line is used, which is the correct one (the launcher writes it as the final output)
+
+**`gui/server.py` `_terminal_stream()`**:
+- Added a rolling `line_buffer` variable that persists across poll cycles
+- Replaced `"CLI exit code:" in chunk` substring check with complete-line parsing: each decoded chunk is split on `\n`, the incomplete last line is retained in `line_buffer`, and complete lines are checked against `^CLI exit code:\s*(-?\d+)\s*$`
+- This handles the split-across-reads case: if `CLI exit ` arrives in one cycle and `code: 0\n` in the next, the rolling buffer reassembles the complete line before matching
+- The anchored regex ensures embedded text like `"The CLI exit code: 3 was returned"` does not trigger a false done event
+
+### Test Additions
+
+| Test | Coverage |
+|---|---|
+| `test_terminal_metadata_ignores_non_sentinel_text` | Metadata does NOT flag finished when `CLI exit code:` appears embedded in other text |
+| `test_terminal_metadata_uses_last_sentinel` | When multiple sentinel lines exist, metadata uses the last (correct) one |
+| `test_terminal_stream_sentinel_split_across_reads` | SSE detects sentinel correctly when the line is split across file writes |
+| `test_terminal_stream_ignores_embedded_sentinel` | SSE only matches sentinel on its own line; embedded text is ignored |
+
+### What Was NOT Changed
+
+- No architectural changes — PowerShell windows, file-based logs, and 500ms polling preserved
+- Frontend (CSS/JS) unchanged
+- VS Code extension unchanged
+- Task auto-refresh, completion prompts, and terminal badges unchanged
+
+### Test Results
+
+```
+py -3 -m pytest tests/test_gui_server.py -q
+49 passed, 1 warning in 4.34s
+```
+
+```
+py -3 -m pytest -q
+129 passed, 4 warnings in 19.82s
+```
+
+## Round 13: Completion Prompt Stale on Task Switch (P2-1 Fix)
+
+### Summary
+
+Fixed a bug where the `attention-pulse` completion button glow persisted incorrectly when switching between two tasks in the same running state. The pulse was only cleared when the button became disabled, so switching from one `CLAUDE_WINDOW_STARTED` task (with an exited Claude) to another `CLAUDE_WINDOW_STARTED` task (with Claude still running) left the old pulse visible — misleading the user into clicking the completion action for the wrong task.
+
+### Root Cause (P2-1)
+
+`showCompletionPrompt()` added the `attention-pulse` CSS class to the completion button for a specific task/client combination, but `updateActionStates()` only removed it when the button transitioned to `disabled`. When both the old and new tasks had the same status (e.g., `CLAUDE_WINDOW_STARTED`), the button stayed enabled across the switch and the stale pulse was never cleared.
+
+### Changes
+
+**`gui/static/app.js`**:
+
+- **Track prompted task**: Added `promptedTaskId: null` field to `terminalConnections.claude` and `terminalConnections.codex`. This records which task ID last triggered a completion prompt for each client.
+
+- **Clear stale pulse in `showCompletionPrompt()`**: Before adding a new pulse, the function now checks if `conn.promptedTaskId` differs from the current `taskId`. If it does, the old pulse is removed. When adding a pulse, `conn.promptedTaskId` is set to the new task ID.
+
+- **Clear pulses in `refreshTerminalsForTask()`**: When the subKey changes (indicating a different task is now selected), both `claude-completed-button` and `codex-completed-button` have their `attention-pulse` class removed immediately. This provides instant cleanup on task switch without waiting for the next `showCompletionPrompt()` call.
+
+- **Clear `promptedTaskId` in `disconnectTerminal()`**: The field is reset to `null` alongside other connection state when a terminal is disconnected, preventing stale state from leaking across connections.
+
+### What Was NOT Changed
+
+- No architectural changes — file-based logs, SSE streaming, and PowerShell windows preserved
+- `updateActionStates()` still clears pulses on button disable (additional safety net)
+- VS Code extension unchanged
+- Backend (server.py) unchanged
+
+### Test Results
+
+```
+py -3 -m pytest tests/test_gui_server.py -q
+49 passed, 1 warning in 3.42s
+```
+
+```
+py -3 -m pytest -q
+129 passed, 4 warnings in 15.61s
+```
+
+## Round 14: Auto-Refresh Stale-Response Guard (P2-1 Fix)
+
+### Summary
+
+Hardened the auto-refresh polling in `loadTasks()` against race conditions when the user switches task views (active → archived/trash) or triggers a task action while an auto-refresh request is in flight. Without this guard, a stale API response could mutate `state.tasks` and recreate terminal streams for the wrong view.
+
+### Root Cause (P2-1)
+
+`startAutoRefresh()` called `loadTasks(true)` on a 4-second interval without any in-flight serialization or stale-response guard. If a poll began in the active view, then the user switched to archived/trash before the response resolved, the stale response could still:
+1. Overwrite `state.tasks` with active-view tasks while the UI shows archived/trash
+2. Call `refreshTerminalsForTask()` and reconnect terminal SSE streams for an outdated task
+3. Call `manageAutoRefresh()` and potentially restart the polling loop after it was stopped
+
+### Changes
+
+**`gui/static/app.js`**:
+
+- **Added `loadGeneration` counter and `refreshInFlight` flag**: Two module-level variables to coordinate concurrent requests.
+  - `loadGeneration` — monotonically increasing counter incremented before each `await api()` call. After the `await`, the captured generation is compared against the current value; a mismatch means a newer request (e.g., from a view switch) superseded this one.
+  - `refreshInFlight` — boolean set `true` when an auto-refresh poll starts and `false` in a `finally` block after completion. The interval callback skips if already `true`, preventing overlapping polls.
+
+- **Stale-response guard in `loadTasks()`**: Before `await api(...)`, captures `gen = ++loadGeneration`, `capturedProjectId`, and `capturedView`. After the `await`, returns early without mutating state if:
+  - `gen !== loadGeneration` (a newer request started)
+  - The current project ID differs from the captured one
+  - `state.taskView` differs from the captured view
+
+- **View-switch invalidation in `setTaskView()`**: Before calling `loadTasks()`, resets `refreshInFlight = false` and increments `loadGeneration`. This ensures any in-flight auto-refresh response from the previous view is discarded by the stale-response guard.
+
+- **`refreshInFlight` is only managed for `skipArtifacts=true` calls** (auto-refresh polls). Direct user-triggered `loadTasks(false)` calls are not gated by the flag, but they still increment `loadGeneration`, which cancels any concurrent auto-refresh poll.
+
+### What Was NOT Changed
+
+- No architectural changes — file-based logs, SSE streaming, and PowerShell windows preserved
+- The `subKey` deduplication in `refreshTerminalsForTask()` remains as a second line of defense
+- Backend (server.py) unchanged
+- VS Code extension unchanged
+- No JavaScript tests added (the test suite is Python-only; browser-level tests would require a separate test framework)
+
+### Test Results
+
+```
+py -3 -m pytest tests/test_gui_server.py tests/test_cli_window.py -q
+55 passed, 1 warning in 3.67s
+```
+
+```
+py -3 -m pytest -q
+129 passed, 4 warnings in 16.69s
+```
+
+## Round 15: Sentinel Parsing Hardening (P2-1) & Stale-Response Guard (P3-1)
+
+### Summary
+
+Hardened the sentinel parser to handle the case where CLI output doesn't end with a newline, causing the `CLI exit code: N` marker to be glued directly to the last output text. Also added a stale-response recheck after `loadArtifacts()` to prevent race conditions when the user switches views during auto-refresh artifact loading.
+
+### P2-1: Sentinel Without Preceding Newline
+
+**Root Cause**: The launcher's `Write-NativeChunk` function writes CLI stdout/stderr as-is via `[System.IO.File]::AppendAllText`, without guaranteeing a trailing newline. The `Add-Content` call that writes `CLI exit code: N` appends its value after any existing content — if the last CLI output didn't end with `\n`, the resulting log line looks like `final outputCLI exit code: 0`. The anchored regex `^CLI exit code:...$` (added in Round 12 to prevent false positives) requires the sentinel at line start, so it misses this case entirely.
+
+**Changes**:
+
+**`gui/orchestrator/cli_window.py`** (launcher fix):
+- Prepended `` `n `` to the sentinel value: `("`nCLI exit code: {{0}}" -f $Code)`. This guarantees the sentinel always starts on its own line regardless of whether the preceding CLI output had a trailing newline.
+
+**`gui/server.py` `_terminal_metadata()`** (parser fallback):
+- After the strict `re.match(r"^CLI exit code:\s*(-?\d+)\s*$", line)` check, added a fallback `re.search(r"CLI exit code:\s*(-?\d+)\s*$", line)` that matches the sentinel at the end of any line. The `$` anchor ensures the sentinel pattern is at end-of-line, not embedded in the middle (e.g., `"Result: CLI exit code: 3 was returned"` will NOT match). This fallback handles log files written by older launcher scripts that don't have the newline fix.
+
+**`gui/server.py` `_terminal_stream()`** (SSE parser fallback):
+- Same fallback added to the line-checking loop in the SSE stream generator. Combined with `line_buffer` (cross-read rolling buffer from Round 12), this catches the sentinel both when split across reads AND when glued to preceding output without a newline.
+
+### P3-1: Stale-Response After Artifact Loading
+
+**Root Cause**: `loadTasks()` had a stale-response guard (gen/project/view check) after `await api(...)` but not after `await loadArtifacts()`. If auto-refresh reached artifact loading and the user switched views during that `await`, the stale response could render artifacts, refresh terminals, and restart auto-refresh for the wrong view.
+
+**Changes** (`gui/static/app.js`):
+
+- Added a full stale-response recheck (generation counter + project + view) immediately after `await loadArtifacts()`. If any of these changed during the artifact fetch, the function returns early before calling `refreshTerminalsForTask()` and `manageAutoRefresh()`.
+
+### Test Additions
+
+| Test | Coverage |
+|---|---|
+| `test_terminal_metadata_sentinel_without_preceding_newline` | Metadata detects `CLI exit code: 0` when glued to preceding output: `"final outputCLI exit code: 0\n"` |
+| `test_terminal_stream_sentinel_without_preceding_newline` | SSE stream emits `done: true, exitCode: 2` when sentinel is glued to output without preceding newline |
+
+### What Was NOT Changed
+
+- No architectural changes — PowerShell windows, file-based logs, and 500ms polling preserved
+- Frontend CSS/HTML unchanged
+- VS Code extension unchanged
+- The existing `re.search` fallback uses `$` anchor to avoid false positives on embedded text (defense in depth with the launcher fix)
+
+### Test Results
+
+```
+py -3 -m pytest tests/test_gui_server.py tests/test_cli_window.py -q
+57 passed, 1 warning in 3.74s
+```
+
+```
+py -3 -m pytest -q
+131 passed, 4 warnings in 16.79s
+```
+
+## Round 16: Stale-Response Guard, SSE False-Positive, Sentinel Test Sync (Codex Round 6 Fixes)
+
+### Summary
+
+Three fixes from Codex review Round 6: hardened the `loadArtifacts()` stale-response guard to prevent state mutation by in-flight auto-refresh responses; removed the unanchored `re.search` fallback from SSE sentinel detection to prevent false-positive done events during live streaming; added a test assertion for the launcher's leading-newline sentinel format.
+
+### P2-1: Stale-Response Guard in loadArtifacts()
+
+**Root Cause**: `loadArtifacts()` fetched data via `await api(...)` and immediately mutated `state.artifacts`, `state.activeArtifact`, and called `renderArtifacts()` — all before the caller's stale-response recheck. If an auto-refresh poll reached artifact loading and the user switched views (active → archived/trash) during that `await`, the stale response would render artifacts for the wrong view.
+
+**Fix** (`gui/static/app.js`):
+
+- `loadArtifacts()` now accepts optional stale-guard parameters: `gen`, `capturedProjectId`, `capturedView`, `capturedTaskId`.
+- After `await api(...)`, before mutating any state, the function validates: generation counter, current project ID, task view, and selected task ID all match the captured values. If any mismatch, the function returns early without touching state.
+- The same stale check applies in both the success path and the `catch` error path.
+- When called without parameters (legacy path), the guard is skipped (backward compatible).
+- `loadTasks()` passes its captured `gen`/`capturedProjectId`/`capturedView`/`state.selectedTaskId` to `loadArtifacts()`. The post-`loadArtifacts()` recheck in `loadTasks()` remains as a second line of defense before `refreshTerminalsForTask()` and `manageAutoRefresh()`.
+- `selectTask()` now also passes stale-guard parameters and checks the generation counter after `loadArtifacts()` returns, preventing stale artifact rendering on rapid task switches.
+
+### P2-2: SSE False-Positive Sentinel Detection
+
+**Root Cause**: `_terminal_stream()` used a fallback `re.search(r"CLI exit code:\s*(-?\d+)\s*$", line)` when the anchored `^CLI exit code:` regex didn't match. The `$` anchor requires the pattern at end-of-line, but output lines like `"I see the CLI exit code: 0"` (where the sentinel-like text coincidentally ends a line) would trigger a false `done` event, close the terminal stream, and prompt the user even though the CLI was still running.
+
+The launcher (Round 15) already guarantees `\nCLI exit code: N` via the `Add-Content -Value ("\`nCLI exit code: {0}" -f $Code)` change, so the sentinel is always on its own line in live streams.
+
+**Fix** (`gui/server.py`):
+
+- Removed the `re.search` fallback from `_terminal_stream()`. The SSE parser now only matches `^CLI exit code:\s*(-?\d+)\s*$` anchored at line start.
+- The `re.search` fallback is preserved in `_terminal_metadata()` for backward compatibility with old log files that may have the sentinel glued to preceding output.
+
+**Test update** (`tests/test_gui_server.py`):
+
+- `test_terminal_stream_sentinel_without_preceding_newline`: Updated to verify the SSE stream correctly **ignores** a glued sentinel (`doneCLI exit code: 2\n`). The stream closes via task status transition (not sentinel detection), and the done event carries no `exitCode`. This validates that the anchored-only parser won't false-trigger on improperly formatted sentinels.
+
+### P3-1: Sentinel Format Test Assertion
+
+**Root Cause**: The launcher's sentinel format changed from `CLI exit code: N` to `\`nCLI exit code: N` in Round 15, but `tests/test_cli_window.py` had no assertion verifying the leading newline escape in the generated script.
+
+**Fix** (`tests/test_cli_window.py`):
+
+- Added `self.assertIn("\`nCLI exit code:", content)` to `test_generate_claude_launcher_inside_task_dir`, verifying the generated PowerShell script writes the sentinel with the leading backtick-n escape. This prevents future regressions of the parser contract.
+
+### What Was NOT Changed
+
+- No architectural changes — PowerShell windows, file-based logs, and 500ms polling preserved
+- `_terminal_metadata()` still uses the `re.search` fallback for backward compat with old logs
+- Frontend CSS/HTML unchanged
+- VS Code extension unchanged
+- No changes to task state machine or CLI window launching
+
+### Test Results
+
+```
+py -3 -m pytest tests/test_gui_server.py tests/test_cli_window.py -q
+57 passed, 1 warning in 3.60s
+```
+
+```
+py -3 -m pytest -q
+131 passed, 4 warnings in 16.42s
+```
+
+## Round 17: SSE Done Event Hardening & Auto-Refresh Selection Guard (Codex Round 7 Fixes)
+
+### Summary
+
+Two fixes from Codex review Round 7: hardened the SSE `done` event handler to only show completion prompts when an actual CLI exit code is detected (preventing false prompts from generic stream closures), and paused auto-refresh polling during `selectTask()` to prevent background polls from invalidating foreground task selections.
+
+### P2-1: SSE Done Event False Prompts
+
+**Root Cause**: The SSE `onmessage` handler called `showCompletionPrompt()` for every `done` event, including those emitted by `_terminal_stream()` when the task status or active client changed (which carry no `exitCode`). Since `conn.done` was set to `true` on any done event and `showCompletionPrompt()` checked `!conn.finished && !conn.done`, a generic stream closure (e.g., from task cancellation) would pass the guard and incorrectly show an "exited" badge and completion prompt.
+
+**Fix** (`gui/static/app.js`):
+
+- **SSE `onmessage` handler**: Only sets `conn.finished = true` and `conn.exitCode` when `data.exitCode != null` (CLI actually exited with a known code). `conn.done` is still set for generic stream closure tracking (used by reconnect logic), but `conn.exitCode` is no longer overwritten with `null` on done-without-exitCode events — preserving the value set by `loadTerminalContent()` from metadata.
+  - `showCompletionPrompt()` is now only called when `data.exitCode != null`, not on every done event.
+
+- **`showCompletionPrompt()` guard**: Changed from `if (!conn.finished && !conn.done) return;` to `if (!conn.finished) return;`. The prompt now requires explicit knowledge that the CLI exited (via `conn.finished`), not just that the EventSource received any done event.
+
+- **`updateClientTitleBadge()`**: Changed badge condition from `conn.finished || isDone` to just `conn.finished`. The "已退出" / "退出码 N" badge only appears when the CLI exit code was parsed from the log sentinel, not when the EventSource merely closed.
+
+### P2-2: Auto-Refresh Invalidates Foreground Selection
+
+**Root Cause**: `selectTask()` did not pause auto-refresh polling. If an auto-refresh poll fired during `selectTask()`'s `await loadArtifacts()`, the poll's `loadTasks(true)` incremented `loadGeneration`, causing `selectTask()`'s subsequent generation check to fail. The foreground selection was then silently abandoned — `refreshTerminalsForTask()` was never called, and the user saw stale state from whatever the background poll rendered last.
+
+**Fix** (`gui/static/app.js`):
+
+- **`selectTask()`**: Added `stopAutoRefresh()` at the start (before any async work) and `manageAutoRefresh()` at the end (after `refreshTerminalsForTask()`). Since JavaScript is single-threaded, `clearInterval` (called by `stopAutoRefresh`) executes synchronously and prevents any new timer callback from being queued during `selectTask()`'s synchronous preamble and subsequent `await`. The existing `++loadGeneration` increment remains as defense-in-depth against any callback that was already queued before `stopAutoRefresh()` ran.
+
+### What Was NOT Changed
+
+- No architectural changes — PowerShell windows, file-based logs, SSE streaming preserved
+- `conn.done` flag retained for EventSource closure tracking (used by reconnect logic)
+- `_terminal_stream()` and `_terminal_metadata()` unchanged
+- No changes to task state machine or CLI window launching
+- VS Code extension unchanged
+
+### Test Results
+
+```
+py -3 -m pytest tests/test_gui_server.py tests/test_cli_window.py -q
+57 passed, 1 warning in 3.76s
+```
+
+```
+py -3 -m pytest -q
+131 passed, 4 warnings in 16.27s
+```
+
+## Round 18: Sentinel Fallback Gate & Auto-Refresh Cleanup Timing (Codex Round 8 Fixes)
+
+### Summary
+
+Two fixes from Codex review Round 8: gated the `_terminal_metadata()` fallback `re.search` so it cannot mark active/running logs as finished (preventing false completion badges and prompts from model output that coincidentally ends with `CLI exit code: N`), and moved `refreshInFlight` cleanup from `loadTasks()`'s inner `finally` to the interval callback's `.finally()` so the flag stays true for the entire auto-refresh operation.
+
+### P2-1: Metadata Fallback False-Positive on Active Tasks
+
+**Root Cause**: `_terminal_metadata()` used a fallback `re.search(r"CLI exit code:\s*(-?\d+)\s*$", line)` when the anchored `^CLI exit code:...$` didn't match. The `$` anchor requires the pattern at end-of-line, but `re.search` allows it anywhere on the line — so a model output line like `"Expected CLI exit code: 0"` (where the sentinel-like text ends the line) would match, setting `finished=true` for a still-running active client and showing a false completion badge and prompt.
+
+The launcher (Round 15) guarantees `\nCLI exit code: N` for all new logs, so the fallback is only needed for backward compatibility with old log files. For actively running tasks, the strict `^CLI exit code: N$` match is always correct.
+
+**Fix** (`gui/server.py`):
+
+- **`_terminal_metadata()` fallback gated by `not active`**: Changed `if not m:` to `if not m and not active:`. When the task is running and this is the active client (`active=True`), only the strict anchored `^CLI exit code: N$` match can set `finished=true`. The fallback `re.search` is only used for non-running tasks (backward compat with old logs).
+
+**Test addition** (`tests/test_gui_server.py`):
+
+- `test_terminal_metadata_ignores_fallback_when_active`: Sets task status to `CLAUDE_WINDOW_STARTED` with `activeClient="claude"`, writes `"Expected CLI exit code: 0\n"` (ends with sentinel pattern but doesn't start with it), and verifies `finished=false, exitCode=null`.
+
+### P3-1: refreshInFlight Cleared Too Early
+
+**Root Cause**: `loadTasks(true)` cleared `refreshInFlight = false` in a `finally` block immediately after `await api(...)` returned, but before artifact loading, terminal refresh, and `manageAutoRefresh()` completed. A subsequent interval callback could start another poll during this window, increment `loadGeneration`, and cause the first poll's `refreshTerminalsForTask()` to be silently abandoned — leaving terminal streams or badges stale under slow responses.
+
+**Fix** (`gui/static/app.js`):
+
+- **Removed `refreshInFlight = false` from `loadTasks()` inner `finally`**: The `try { data = await api(...); } finally { if (skipArtifacts) refreshInFlight = false; }` was simplified to `const data = await api(...);`.
+
+- **Interval callback uses `.finally()`**: Changed `loadTasks(true)` (fire-and-forget) to `loadTasks(true).finally(() => { refreshInFlight = false; })`. The flag now stays true until ALL work completes: API fetch, stale checks, task render, artifact loading, terminal refresh, and auto-refresh management. Early returns (stale guard, no project) still trigger the `.finally()` cleanup.
+
+### What Was NOT Changed
+
+- No architectural changes — PowerShell windows, file-based logs, SSE streaming preserved
+- `_terminal_stream()` SSE parser unchanged (already uses strict anchored-only matching since Round 16)
+- `_terminal_metadata()` fallback behavior for non-running tasks unchanged (backward compat)
+- `refreshInFlight` not managed for direct user-triggered `loadTasks(false)` calls (they don't set it)
+- VS Code extension unchanged
+
+### Test Results
+
+```
+py -3 -m pytest tests/test_gui_server.py tests/test_cli_window.py -q
+58 passed, 1 warning in 4.11s
+```
+
+```
+py -3 -m pytest -q
+132 passed, 4 warnings in 16.84s
+```
+
+## Round 19: Stale Badge Cleanup & Panel Flex Layout (Codex Round 10 Fixes)
+
+### Summary
+
+Two fixes from Codex review Round 10: cleared stale per-client terminal badges when switching away from a task, and converted the history/artifact panels to flexbox layout so the inspector grid rows can actually shrink to their `minmax(80px, 0.3fr)` lower bound without being forced larger by child min-heights.
+
+### P3-1: Stale Terminal Badges on Task Deselect
+
+**Root Cause**: `updateTerminalBadges()` returned early when `!task`, only updating the aggregate `#terminal-state` label to "待选择". The per-client badge DOM elements inside each `.terminal-title` were left untouched, so switching to an empty archived/trash/active view after a finished CLI could leave stale "已退出" or "退出码 N" badges visible.
+
+**Fix** (`gui/static/app.js`):
+
+- Added `clearClientTitleBadge(client)` helper that resets a client's terminal title badge to "待启动" with the default badge class.
+- Called `clearClientTitleBadge("claude")` and `clearClientTitleBadge("codex")` in the `!task` branch of `updateTerminalBadges()` before the early return.
+
+### P3-2: Inspector Panel Children Force Overflow Instead of Scrolling
+
+**Root Cause**: The inspector grid rows 3 and 4 (`minmax(80px, 0.3fr)`) could theoretically shrink to 80px, but the children inside `.terminal-panel` and `.artifact-panel` had large fixed `min-height` values: `#task-history` at 130px, `.task-list` at 130px, and `#artifact-content` at 170px. Since the panels had no `overflow: hidden` or flex constraint, these children forced the grid rows to expand beyond their allocated fractional space, causing the inspector/page to overflow instead of internally scrolling.
+
+**Fix** (`gui/static/styles.css`):
+
+- `.terminal-panel, .artifact-panel` — added `display: flex; flex-direction: column; min-height: 0; overflow: hidden;` so the panels respect their grid row's height constraint and children can shrink.
+- `#task-history` — replaced `height: calc(50% - 62px)` / `min-height: 130px` with `flex: 1; min-height: 0;`. The element now fills available space and scrolls internally when content exceeds it.
+- `.task-list` — replaced `height: calc(50% - 18px)` / `min-height: 130px` with `flex: 1; min-height: 0;`.
+- `#artifact-content` — replaced `height: calc(100% - 84px)` / `min-height: 170px` with `flex: 1; min-height: 0;`.
+- The `.panel-heading` and `.task-view-toggle` / `.tabs` children auto-size within the flex column, and the remaining space is split equally between the scrollable areas via `flex: 1`.
+
+### What Was NOT Changed
+
+- No architectural changes — PowerShell windows, file-based logs, and 500ms polling preserved
+- The inspector grid row allocation (`minmax(380px, 1.4fr)` for terminals, `minmax(80px, 0.3fr)` for lower panels) unchanged
+- Backend (server.py) unchanged
+- VS Code extension unchanged
+- No HTML changes needed
+
+### Test Results
+
+```
+py -3 -m pytest -q
+132 passed, 4 warnings in 16.49s
+```
+
+## Round 20: CLI Exit Sentinel Coverage (P2-1 Fix)
+
+### Summary
+
+Ensured every termination path in the PowerShell launcher script writes the `CLI exit code: N` sentinel. Previously, the command-not-found branch (exit 127) and the `catch` block (exception) both exited or continued without appending the sentinel, so the SSE stream never emitted an `exitCode`, metadata reported `finished=false`, and the frontend never prompted the user to advance the task.
+
+### Root Cause (P2-1)
+
+The launcher script (`generate_launcher_script()` in `cli_window.py`) had two termination paths that skipped the sentinel:
+
+1. **Command-not-found** (line 291-296): `if (-not (Get-Command $CommandName ...))` wrote an error message to the log, then `exit 127` — without writing `` `nCLI exit code: 127 ``.
+2. **Catch block** (line 341-344): `catch { Write-Host ...; Add-Content ... $_.Exception.Message }` logged the exception but never wrote the sentinel. The script then fell through to the `Read-Host` prompt and exited without the sentinel in the log.
+
+### Changes
+
+**`gui/orchestrator/cli_window.py`**:
+
+- **Command-not-found path**: Added `Add-Content -LiteralPath $LogFile -Value ("\`nCLI exit code: 127") -Encoding UTF8` before the `Read-Host` / `exit 127`. The backend parser now detects the sentinel and the frontend shows the completion prompt.
+- **Catch block**: Added `if ($null -eq $Code) { $Code = 1 }` guard (handles exceptions thrown before `$Code` was assigned) followed by `Add-Content -LiteralPath $LogFile -Value ("\`nCLI exit code: {0}" -f $Code) -Encoding UTF8`. If the exception occurred after `$Code` was set (e.g., in the output-missing check), the original exit code is preserved; otherwise it defaults to 1.
+
+**`tests/test_cli_window.py`**:
+
+| Test | Change |
+|---|---|
+| `test_generate_claude_launcher_inside_task_dir` | Added assertions for `` `nCLI exit code: 127 `` (command-not-found sentinel) and `$null -eq $Code` (catch block guard) |
+| `test_generate_codex_launcher_mentions_output_file` | Same two assertions added |
+
+### What Was NOT Changed
+
+- No architectural changes — PowerShell windows, file-based logs, and 500ms polling preserved
+- Backend sentinel parsing (`_terminal_metadata()`, `_terminal_stream()`) unchanged
+- Frontend (CSS/JS) unchanged
+- VS Code extension unchanged
+- No changes to task state machine or CLI window launching API
+
+### Test Results
+
+```
+py -3 -m pytest tests/test_gui_server.py tests/test_cli_window.py -q
+58 passed, 1 warning in 3.78s
+```
+
+```
+py -3 -m pytest -q
+132 passed, 4 warnings in 14.95s
+```

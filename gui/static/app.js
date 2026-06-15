@@ -43,8 +43,8 @@ const terminalStatuses = new Set(["PASS", "BLOCKED", "FAILED", "CANCELLED"]);
 const runningTaskStatuses = new Set(["CLAUDE_WINDOW_STARTED", "CODEX_WINDOW_STARTED"]);
 
 const terminalConnections = {
-  claude: { source: null, done: false, subKey: null, reconnectTimer: null, reconnectDelay: 1000 },
-  codex: { source: null, done: false, subKey: null, reconnectTimer: null, reconnectDelay: 1000 },
+  claude: { source: null, done: false, subKey: null, reconnectTimer: null, reconnectDelay: 1000, finished: false, exitCode: null, lastLogUpdateAt: null, promptedTaskId: null },
+  codex: { source: null, done: false, subKey: null, reconnectTimer: null, reconnectDelay: 1000, finished: false, exitCode: null, lastLogUpdateAt: null, promptedTaskId: null },
 };
 
 // xterm.js terminal instances
@@ -75,6 +75,10 @@ const terminalInstances = {
   claude: { term: null, fitAddon: null, observer: null, hasOutput: false },
   codex: { term: null, fitAddon: null, observer: null, hasOutput: false },
 };
+
+let taskRefreshTimer = null;
+let loadGeneration = 0;
+let refreshInFlight = false;
 
 function createTerminal(client) {
   destroyTerminal(client);
@@ -194,10 +198,17 @@ function connectTerminal(client) {
       if (data.done) {
         if (terminalConnections[client].source === es) {
           terminalConnections[client].done = true;
+          if (data.exitCode != null) {
+            terminalConnections[client].finished = true;
+            terminalConnections[client].exitCode = data.exitCode;
+          }
           es.close();
           terminalConnections[client].source = null;
         }
         updateTerminalBadges();
+        if (data.exitCode != null) {
+          showCompletionPrompt(client, taskId);
+        }
       }
     } catch (_e) {
       // ignore parse errors
@@ -244,6 +255,10 @@ function disconnectTerminal(client) {
     conn.source = null;
   }
   conn.done = false;
+  conn.finished = false;
+  conn.exitCode = null;
+  conn.lastLogUpdateAt = null;
+  conn.promptedTaskId = null;
 }
 
 function disconnectAllTerminals() {
@@ -260,6 +275,8 @@ function updateTerminalBadges() {
   if (!task) {
     state.textContent = "待选择";
     state.className = "status-pill";
+    clearClientTitleBadge("claude");
+    clearClientTitleBadge("codex");
     return;
   }
 
@@ -286,6 +303,18 @@ function updateTerminalBadges() {
   }
 }
 
+function clearClientTitleBadge(client) {
+  const box = document.getElementById(`${client}-terminal-box`);
+  if (!box) return;
+  const title = box.querySelector(".terminal-title");
+  if (!title) return;
+  const badge = title.querySelector(".terminal-client-badge");
+  if (badge) {
+    badge.textContent = "待启动";
+    badge.className = "terminal-client-badge";
+  }
+}
+
 function updateClientTitleBadge(client, task) {
   const box = document.getElementById(`${client}-terminal-box`);
   if (!box) return;
@@ -302,20 +331,61 @@ function updateClientTitleBadge(client, task) {
   const isActive = task.activeClient === client && runningTaskStatuses.has(task.status);
   const isConnected = terminalConnections[client].source !== null;
   const isDone = terminalConnections[client].done;
+  const conn = terminalConnections[client];
 
   if (isConnected) {
     badge.textContent = "实时";
     badge.className = "terminal-client-badge active";
-  } else if (isDone) {
-    badge.textContent = "完成";
-    badge.className = "terminal-client-badge";
+  } else if (conn.finished) {
+    if (conn.exitCode === 0 || conn.exitCode === "0") {
+      badge.textContent = "已退出";
+      badge.className = "terminal-client-badge";
+    } else if (conn.exitCode != null) {
+      badge.textContent = "退出码 " + conn.exitCode;
+      badge.className = "terminal-client-badge warn";
+    } else {
+      badge.textContent = "已退出";
+      badge.className = "terminal-client-badge";
+    }
   } else if (isActive) {
     badge.textContent = "运行中";
     badge.className = "terminal-client-badge active";
   } else {
-    badge.textContent = "";
+    badge.textContent = "待启动";
     badge.className = "terminal-client-badge";
   }
+}
+
+function showCompletionPrompt(client, taskId) {
+  const task = selectedTask();
+  const conn = terminalConnections[client];
+
+  // Guard: return early if this call is for a different task — must precede
+  // any DOM mutations so a stale call cannot clear the current task's pulse.
+  if (!task || task.id !== taskId) return;
+  if (!conn.finished) return;
+
+  const buttonId = client === "claude" ? "claude-completed-button" : "codex-completed-button";
+  const button = document.getElementById(buttonId);
+
+  // Clear pulse if this is a different task than the one last prompted
+  if (button && conn.promptedTaskId && conn.promptedTaskId !== taskId) {
+    button.classList.remove("attention-pulse");
+    conn.promptedTaskId = null;
+  }
+
+  const isActiveForClient =
+    (client === "claude" && task.activeClient === "claude" && task.status === "CLAUDE_WINDOW_STARTED") ||
+    (client === "codex" && task.activeClient === "codex" && task.status === "CODEX_WINDOW_STARTED");
+
+  if (!isActiveForClient) return;
+  if (!button) return;
+
+  const clientName = clientLabels[client] || client;
+  const exitInfo = conn.exitCode != null ? " (退出码 " + conn.exitCode + ")" : "";
+  button.classList.add("attention-pulse");
+  conn.promptedTaskId = taskId;
+  toast(clientName + " CLI 已退出" + exitInfo + "，请点击 \"" + clientName + " 已完成\" 推进任务");
 }
 
 async function loadTerminalContent(client, taskId, taskRound) {
@@ -329,17 +399,25 @@ async function loadTerminalContent(client, taskId, taskRound) {
 
     if (!meta.exists) {
       term.write("\x1b[2m（" + (client === "claude" ? "Claude" : "Codex") + " CLI 尚未启动或日志文件不存在。）\x1b[0m\r\n");
+      updateTerminalBadges();
       return;
     }
     const artifacts = await api(`/api/tasks/${taskId}/artifacts`);
     const current2 = selectedTask();
     if (!current2 || current2.id !== taskId || current2.round !== taskRound) return;
 
+    const conn = terminalConnections[client];
+    conn.finished = meta.finished || false;
+    conn.exitCode = meta.exitCode ?? null;
+    conn.lastLogUpdateAt = meta.lastLogUpdateAt ?? null;
+
     const logName = meta.logName;
     if (artifacts.artifacts && artifacts.artifacts[logName] && artifacts.artifacts[logName].exists) {
       term.write(artifacts.artifacts[logName].content);
     }
     terminalInstances[client].hasOutput = true;
+    updateTerminalBadges();
+    showCompletionPrompt(client, taskId);
   } catch (_e) {
     const current = selectedTask();
     if (!current || current.id !== taskId || current.round !== taskRound) return;
@@ -357,6 +435,9 @@ function refreshTerminalsForTask() {
   if (claudeKey === terminalConnections.claude.subKey && codexKey === terminalConnections.codex.subKey) {
     return;
   }
+  // Clear stale completion prompts from the previous task
+  $("claude-completed-button").classList.remove("attention-pulse");
+  $("codex-completed-button").classList.remove("attention-pulse");
   terminalConnections.claude.subKey = claudeKey;
   terminalConnections.codex.subKey = codexKey;
 
@@ -552,10 +633,23 @@ function taskEndpointForView() {
   return "/api/tasks";
 }
 
-async function loadTasks() {
+async function loadTasks(skipArtifacts = false) {
   const project = selectedProject();
   if (!project) return;
+
+  const gen = ++loadGeneration;
+  const capturedProjectId = project.id;
+  const capturedView = state.taskView;
+
   const data = await api(taskEndpointForView());
+
+  // Stale-response guard: if generation, project, or view changed during the request, discard
+  if (gen !== loadGeneration) return;
+  const currentProject = selectedProject();
+  if (!currentProject || currentProject.id !== capturedProjectId) return;
+  if (state.taskView !== capturedView) return;
+
+  const prevIds = state.tasks.map(t => t.id + "|" + t.status + "|" + t.activeClient + "|" + t.progress).join(",");
   state.tasks = (data.tasks || [])
     .filter((task) => task.projectId === project.id)
     .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
@@ -570,9 +664,18 @@ async function loadTasks() {
   } else {
     localStorage.removeItem("selectedTaskId");
   }
+  const currIds = state.tasks.map(t => t.id + "|" + t.status + "|" + t.activeClient + "|" + t.progress).join(",");
+  const tasksChanged = prevIds !== currIds;
   renderTasks();
-  await loadArtifacts();
+  if (!skipArtifacts || tasksChanged) await loadArtifacts(gen, capturedProjectId, capturedView, state.selectedTaskId);
+  // Recheck after artifact loading — loadArtifacts has its own stale guard, but
+  // we still need to verify before calling refreshTerminalsForTask / manageAutoRefresh
+  if (gen !== loadGeneration) return;
+  const currentProject2 = selectedProject();
+  if (!currentProject2 || currentProject2.id !== capturedProjectId) return;
+  if (state.taskView !== capturedView) return;
   refreshTerminalsForTask();
+  manageAutoRefresh();
 }
 
 function renderTasks() {
@@ -688,11 +791,16 @@ function formatTime(iso) {
 }
 
 async function selectTask(id) {
+  stopAutoRefresh();
   state.selectedTaskId = id;
   localStorage.setItem("selectedTaskId", id);
   renderTasks();
-  await loadArtifacts();
+  const gen = ++loadGeneration;
+  const project = selectedProject();
+  await loadArtifacts(gen, project?.id, state.taskView, id);
+  if (gen !== loadGeneration) return;
   refreshTerminalsForTask();
+  manageAutoRefresh();
 }
 
 function renderTaskDetails() {
@@ -735,7 +843,7 @@ function renderTaskDetails() {
   updateActionStates();
 }
 
-async function loadArtifacts() {
+async function loadArtifacts(gen, capturedProjectId, capturedView, capturedTaskId) {
   const task = selectedTask();
   if (!task || state.taskView === "trash") {
     state.artifacts = {};
@@ -745,6 +853,14 @@ async function loadArtifacts() {
   }
   try {
     const data = await api(`/api/tasks/${task.id}/artifacts`);
+    // Stale-response guard: if gen, project, view, or task changed during fetch, discard
+    if (gen !== undefined) {
+      if (gen !== loadGeneration) return;
+      const currentProject = selectedProject();
+      if (!currentProject || currentProject.id !== capturedProjectId) return;
+      if (state.taskView !== capturedView) return;
+      if (state.selectedTaskId !== capturedTaskId) return;
+    }
     state.artifacts = data.artifacts || {};
     const keys = Object.keys(state.artifacts);
     if (!state.activeArtifact || !state.artifacts[state.activeArtifact]) {
@@ -752,6 +868,14 @@ async function loadArtifacts() {
     }
     renderArtifacts();
   } catch (error) {
+    // Stale check in error path too
+    if (gen !== undefined) {
+      if (gen !== loadGeneration) return;
+      const currentProject = selectedProject();
+      if (!currentProject || currentProject.id !== capturedProjectId) return;
+      if (state.taskView !== capturedView) return;
+      if (state.selectedTaskId !== capturedTaskId) return;
+    }
     state.artifacts = {};
     state.activeArtifact = null;
     renderArtifacts();
@@ -796,6 +920,10 @@ function updateActionStates() {
   $("claude-completed-button").disabled = !task || !isActiveView || status !== "CLAUDE_WINDOW_STARTED";
   $("launch-codex-button").disabled = !task || !isActiveView || status !== "WAITING_FOR_CODEX";
   $("codex-completed-button").disabled = !task || !isActiveView || status !== "CODEX_WINDOW_STARTED";
+
+  // Clear completion prompts when buttons become disabled
+  if ($("claude-completed-button").disabled) $("claude-completed-button").classList.remove("attention-pulse");
+  if ($("codex-completed-button").disabled) $("codex-completed-button").classList.remove("attention-pulse");
   $("cancel-task-button").disabled = !task || !isActiveView || terminalStatuses.has(status);
   $("archive-task-button").disabled = !task || !isActiveView || taskIsRunning;
   $("restore-task-button").disabled = !task || !isArchiveView;
@@ -813,7 +941,40 @@ async function setTaskView(view) {
   destroyAllTerminals();
   terminalConnections.claude.subKey = null;
   terminalConnections.codex.subKey = null;
+  refreshInFlight = false;
+  ++loadGeneration;
   await loadTasks();
+}
+
+function manageAutoRefresh() {
+  if (state.taskView !== "active") {
+    stopAutoRefresh();
+    return;
+  }
+  const task = selectedTask();
+  const hasRunning = state.tasks.some(t => runningTaskStatuses.has(t.status));
+  if (hasRunning || (task && runningTaskStatuses.has(task.status))) {
+    startAutoRefresh();
+  } else {
+    stopAutoRefresh();
+  }
+}
+
+function startAutoRefresh() {
+  if (taskRefreshTimer) return;
+  taskRefreshTimer = setInterval(() => {
+    if (state.taskView !== "active") { stopAutoRefresh(); return; }
+    if (refreshInFlight) return;
+    refreshInFlight = true;
+    loadTasks(true).finally(() => { refreshInFlight = false; });
+  }, 4000);
+}
+
+function stopAutoRefresh() {
+  if (taskRefreshTimer) {
+    clearInterval(taskRefreshTimer);
+    taskRefreshTimer = null;
+  }
 }
 
 async function addProject(event) {

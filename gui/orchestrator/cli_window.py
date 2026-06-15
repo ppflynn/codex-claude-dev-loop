@@ -291,6 +291,7 @@ Write-Host ''
 if (-not (Get-Command $CommandName -ErrorAction SilentlyContinue)) {{
   Write-Host "ERROR: CLI command not found: $CommandName" -ForegroundColor Red
   Add-Content -LiteralPath $LogFile -Value "CLI command not found: $CommandName" -Encoding UTF8
+  Add-Content -LiteralPath $LogFile -Value ("`nCLI exit code: 127") -Encoding UTF8
   Read-Host 'Press Enter to close this window'
   exit 127
 }}
@@ -337,10 +338,12 @@ try {{
     & $CommandName @CliArgs
     $Code = $LASTEXITCODE
   }}
-  Add-Content -LiteralPath $LogFile -Value ("CLI exit code: {{0}}" -f $Code) -Encoding UTF8
+  Add-Content -LiteralPath $LogFile -Value ("`nCLI exit code: {{0}}" -f $Code) -Encoding UTF8
 }} catch {{
   Write-Host $_.Exception.Message -ForegroundColor Red
   Add-Content -LiteralPath $LogFile -Value $_.Exception.Message -Encoding UTF8
+  if ($null -eq $Code) {{ $Code = 1 }}
+  Add-Content -LiteralPath $LogFile -Value ("`nCLI exit code: {{0}}" -f $Code) -Encoding UTF8
 }}
 if ($TemporaryCodexFiles.Count -gt 0) {{
   foreach ($TemporaryFile in $TemporaryCodexFiles) {{

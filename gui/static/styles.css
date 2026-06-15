@@ -316,10 +316,17 @@ textarea:focus {
 
 .editor-panel,
 .run-panel,
-.run-status,
+.run-status {
+  padding: 12px;
+}
+
 .terminal-panel,
 .artifact-panel {
   padding: 12px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .panel-heading {
@@ -453,7 +460,7 @@ textarea:focus {
 
 .inspector {
   display: grid;
-  grid-template-rows: auto minmax(200px, 0.55fr) minmax(140px, 0.65fr) minmax(140px, 0.8fr);
+  grid-template-rows: auto minmax(380px, 1.4fr) minmax(80px, 0.3fr) minmax(80px, 0.3fr);
   gap: 12px;
   padding: 12px;
 }
@@ -570,7 +577,7 @@ textarea:focus {
   display: grid;
   grid-template-rows: 1fr 1fr;
   gap: 2px;
-  min-height: 120px;
+  min-height: 260px;
   border: 1px solid var(--term-tab-border);
   border-radius: 4px;
   overflow: hidden;
@@ -582,6 +589,7 @@ textarea:focus {
   grid-template-rows: auto 1fr;
   min-height: 0;
   background: var(--term-bg);
+  overflow: hidden;
 }
 
 .terminal-box:first-child {
@@ -612,6 +620,11 @@ textarea:focus {
   color: #fff;
 }
 
+.terminal-title .terminal-client-badge.warn {
+  background: #9a6a16;
+  color: #fff;
+}
+
 /* xterm container fills the remaining terminal-box space */
 .terminal-output {
   min-height: 0;
@@ -639,8 +652,8 @@ textarea:focus {
 }
 
 #task-history {
-  height: calc(50% - 62px);
-  min-height: 130px;
+  flex: 1;
+  min-height: 0;
   border: 1px solid var(--code-line);
   border-radius: 6px;
 }
@@ -668,16 +681,16 @@ textarea:focus {
 .task-list {
   display: grid;
   gap: 8px;
-  height: calc(50% - 18px);
-  min-height: 130px;
+  flex: 1;
+  min-height: 0;
   margin-top: 10px;
   overflow: auto;
   padding-right: 2px;
 }
 
 #artifact-content {
-  height: calc(100% - 84px);
-  min-height: 170px;
+  flex: 1;
+  min-height: 0;
   border: 1px solid var(--code-line);
   border-radius: 6px;
 }
@@ -763,4 +776,15 @@ textarea:focus {
 
 .status-pill.running {
   animation: pulse-running 1.5s ease-in-out infinite;
+}
+
+.attention-pulse {
+  animation: attention-glow 2s ease-in-out infinite;
+  border-color: var(--primary) !important;
+  box-shadow: 0 0 8px rgba(36, 107, 92, 0.4);
+}
+
+@keyframes attention-glow {
+  0%, 100% { box-shadow: 0 0 4px rgba(36, 107, 92, 0.3); }
+  50% { box-shadow: 0 0 14px rgba(36, 107, 92, 0.7); }
 }
