@@ -740,6 +740,9 @@ class TerminalApiTests(unittest.TestCase):
         self.assertFalse(meta["exists"])
         self.assertEqual(meta["size"], 0)
         self.assertIsNone(meta["updatedAt"])
+        self.assertFalse(meta["finished"])
+        self.assertIsNone(meta["exitCode"])
+        self.assertIsNone(meta["lastLogUpdateAt"])
 
     def test_terminal_metadata_for_existing_log(self):
         _root, task_store, task = self.make_store_and_task()
@@ -755,6 +758,9 @@ class TerminalApiTests(unittest.TestCase):
         self.assertEqual(meta["status"], "CLAUDE_WINDOW_STARTED")
         self.assertTrue(meta["active"])
         self.assertIsNotNone(meta["updatedAt"])
+        self.assertFalse(meta["finished"])
+        self.assertIsNone(meta["exitCode"])
+        self.assertIsNotNone(meta["lastLogUpdateAt"])
 
     def test_terminal_metadata_uses_task_round(self):
         _root, task_store, task = self.make_store_and_task()
@@ -959,6 +965,231 @@ class TerminalApiTests(unittest.TestCase):
         # With incremental decoder, no replacement characters should appear for
         # the split sequence.
         self.assertNotIn("�", output)
+
+    def test_terminal_metadata_parses_cli_exit_code_zero(self):
+        """Metadata should report finished=true, exitCode=0 when log contains CLI exit code: 0."""
+        _root, task_store, task = self.make_store_and_task()
+        log_path = task_store.task_dir(task.id) / "claude_window_round_1.log"
+        log_path.write_text("some output\nCLI exit code: 0\nmore output\n", encoding="utf-8")
+        meta = server._terminal_metadata(task_store, task, "claude")
+        self.assertTrue(meta["finished"])
+        self.assertEqual(meta["exitCode"], 0)
+
+    def test_terminal_metadata_parses_nonzero_exit_code(self):
+        """Metadata should report finished=true with the correct non-zero exit code."""
+        _root, task_store, task = self.make_store_and_task()
+        log_path = task_store.task_dir(task.id) / "codex_window_round_1.log"
+        log_path.write_text("error output\nCLI exit code: 3\n", encoding="utf-8")
+        meta = server._terminal_metadata(task_store, task, "codex")
+        self.assertTrue(meta["finished"])
+        self.assertEqual(meta["exitCode"], 3)
+
+    def test_sse_done_event_includes_exit_code(self):
+        """SSE done event should include exitCode when log contains CLI exit code."""
+        from unittest import mock as umock
+
+        _root, task_store, task = self.make_store_and_task()
+        task.status = Status.CODEX_WINDOW_STARTED
+        task.round = 1
+        task_store.save(task)
+
+        log_path = task_store.task_dir(task.id) / "codex_window_round_1.log"
+        log_path.write_text("line1\nCLI exit code: 5\n", encoding="utf-8")
+
+        wfile = _FakeWfile(None)
+
+        def flush():
+            pass
+
+        with umock.patch("time.sleep", lambda _: None):
+            server._terminal_stream(task_store, task.id, "codex", wfile, flush)
+
+        output = b"".join(wfile._buf).decode("utf-8")
+        # Find the done event
+        done_payload = None
+        for line in output.splitlines():
+            if line.startswith("data: "):
+                data = json.loads(line[6:])
+                if data.get("done"):
+                    done_payload = data
+                    break
+        self.assertIsNotNone(done_payload)
+        self.assertTrue(done_payload["done"])
+        self.assertEqual(done_payload["exitCode"], 5)
+
+    def test_terminal_metadata_ignores_non_sentinel_text(self):
+        """Metadata should NOT flag finished when CLI exit code: appears as embedded text."""
+        _root, task_store, task = self.make_store_and_task()
+        log_path = task_store.task_dir(task.id) / "claude_window_round_1.log"
+        log_path.write_text("The CLI exit code: 5 was checked in the report\n", encoding="utf-8")
+        meta = server._terminal_metadata(task_store, task, "claude")
+        self.assertFalse(meta["finished"])
+        self.assertIsNone(meta["exitCode"])
+
+    def test_terminal_metadata_ignores_fallback_when_active(self):
+        """Metadata must NOT flag finished when non-sentinel text ends with CLI exit code: N on an active/running task."""
+        _root, task_store, task = self.make_store_and_task()
+        task.status = "CLAUDE_WINDOW_STARTED"
+        task.activeClient = "claude"
+        task_store.save(task)
+        log_path = task_store.task_dir(task.id) / "claude_window_round_1.log"
+        # "Expected CLI exit code: 0" ends with the sentinel pattern — the
+        # fallback re.search with $ would match, but active=True gates it.
+        log_path.write_text("Expected CLI exit code: 0\n", encoding="utf-8")
+        meta = server._terminal_metadata(task_store, task, "claude")
+        self.assertFalse(meta["finished"])
+        self.assertIsNone(meta["exitCode"])
+
+    def test_terminal_metadata_uses_last_sentinel(self):
+        """Metadata should use the last CLI exit code line when multiple exist."""
+        _root, task_store, task = self.make_store_and_task()
+        log_path = task_store.task_dir(task.id) / "claude_window_round_1.log"
+        log_path.write_text("CLI exit code: 0\nsome output\nCLI exit code: 7\n", encoding="utf-8")
+        meta = server._terminal_metadata(task_store, task, "claude")
+        self.assertTrue(meta["finished"])
+        self.assertEqual(meta["exitCode"], 7)
+
+    def test_terminal_stream_sentinel_split_across_reads(self):
+        """SSE should detect CLI exit code sentinel when split across file writes."""
+        from unittest import mock as umock
+
+        _root, task_store, task = self.make_store_and_task()
+        task.status = Status.CODEX_WINDOW_STARTED
+        task.round = 1
+        task_store.save(task)
+
+        log_path = task_store.task_dir(task.id) / "codex_window_round_1.log"
+        log_path.write_text("", encoding="utf-8")
+
+        wfile = _FakeWfile(None)
+
+        def flush():
+            pass
+
+        sleep_count = [0]
+        plan = [
+            "prefix\nCLI exit ",      # partial sentinel line
+            "code: 5\n",               # completes the sentinel
+        ]
+
+        def fake_sleep(_):
+            sleep_count[0] += 1
+            idx = sleep_count[0] - 1
+            if idx < len(plan):
+                with log_path.open("ab") as f:
+                    f.write(plan[idx].encode("utf-8"))
+            elif idx == len(plan):
+                task.status = Status.WAITING_FOR_CLAUDE
+                task_store.save(task)
+
+        with umock.patch("time.sleep", fake_sleep):
+            server._terminal_stream(task_store, task.id, "codex", wfile, flush)
+
+        output = b"".join(wfile._buf).decode("utf-8")
+        done_payload = None
+        for line in output.splitlines():
+            if line.startswith("data: "):
+                data = json.loads(line[6:])
+                if data.get("done"):
+                    done_payload = data
+                    break
+        self.assertIsNotNone(done_payload)
+        self.assertTrue(done_payload["done"])
+        self.assertEqual(done_payload["exitCode"], 5)
+
+    def test_terminal_stream_ignores_embedded_sentinel(self):
+        """SSE only matches CLI exit code: on its own line, not embedded in other text."""
+        from unittest import mock as umock
+
+        _root, task_store, task = self.make_store_and_task()
+        task.status = Status.CODEX_WINDOW_STARTED
+        task.round = 1
+        task_store.save(task)
+
+        log_path = task_store.task_dir(task.id) / "codex_window_round_1.log"
+        # Embedded text on one line, real sentinel on its own line
+        log_path.write_text("Result: CLI exit code: 3 was returned\nCLI exit code: 0\n", encoding="utf-8")
+
+        wfile = _FakeWfile(None)
+
+        def flush():
+            pass
+
+        with umock.patch("time.sleep", lambda _: None):
+            server._terminal_stream(task_store, task.id, "codex", wfile, flush)
+
+        output = b"".join(wfile._buf).decode("utf-8")
+        done_payload = None
+        for line in output.splitlines():
+            if line.startswith("data: "):
+                data = json.loads(line[6:])
+                if data.get("done"):
+                    done_payload = data
+                    break
+        self.assertIsNotNone(done_payload)
+        self.assertTrue(done_payload["done"])
+        # The embedded text "Result: CLI exit code: 3 was returned" must NOT match
+        # (anchored to ^CLI exit code:). The real sentinel on its own line gives exitCode=0.
+        self.assertEqual(done_payload["exitCode"], 0)
+
+    def test_terminal_metadata_sentinel_without_preceding_newline(self):
+        """Metadata detects CLI exit code when appended directly after CLI output without newline."""
+        _root, task_store, task = self.make_store_and_task()
+        log_path = task_store.task_dir(task.id) / "claude_window_round_1.log"
+        # Simulate: CLI's last output chunk had no trailing newline, sentinel glued directly
+        log_path.write_text("final outputCLI exit code: 0\n", encoding="utf-8")
+        meta = server._terminal_metadata(task_store, task, "claude")
+        self.assertTrue(meta["finished"])
+        self.assertEqual(meta["exitCode"], 0)
+
+    def test_terminal_stream_sentinel_without_preceding_newline(self):
+        """SSE ignores CLI exit code sentinel when not on its own line (glued to output).
+
+        The launcher now guarantees a leading newline before the sentinel, so the SSE
+        parser only matches ``^CLI exit code:`` at line start. A sentinel glued to the
+        preceding output without a newline must NOT trigger a done event.
+        """
+        from unittest import mock as umock
+
+        _root, task_store, task = self.make_store_and_task()
+        task.status = Status.CLAUDE_WINDOW_STARTED
+        task.round = 1
+        task_store.save(task)
+
+        log_path = task_store.task_dir(task.id) / "claude_window_round_1.log"
+        # Simulate: CLI's last output chunk had no trailing newline (old launcher bug)
+        log_path.write_text("doneCLI exit code: 2\n", encoding="utf-8")
+
+        wfile = _FakeWfile(None)
+
+        def flush():
+            pass
+
+        sleep_count = [0]
+
+        def fake_sleep(_):
+            sleep_count[0] += 1
+            if sleep_count[0] == 2:
+                # After the stream has read the content (and NOT detected the sentinel),
+                # transition the task out of running to stop the stream cleanly.
+                task.status = Status.WAITING_FOR_CLAUDE
+                task_store.save(task)
+
+        with umock.patch("time.sleep", fake_sleep):
+            server._terminal_stream(task_store, task.id, "claude", wfile, flush)
+
+        output = b"".join(wfile._buf).decode("utf-8")
+        done_payload = None
+        for line in output.splitlines():
+            if line.startswith("data: "):
+                data = json.loads(line[6:])
+                if data.get("done"):
+                    done_payload = data
+                    break
+        self.assertIsNotNone(done_payload)
+        self.assertTrue(done_payload["done"])
+        # The glued sentinel must NOT be detected — done event has no exitCode
+        self.assertNotIn("exitCode", done_payload)
 
     def test_terminal_stream_endpoint_missing_log_still_responds(self):
         root = server.ROOT / ".gui" / "test-tmp" / f"termstream-{uuid.uuid4().hex}"

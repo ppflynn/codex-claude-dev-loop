@@ -50,6 +50,9 @@ class CliWindowTests(unittest.TestCase):
         self.assertIn("Claude args:", content)
         self.assertIn("$ClaudeArgs += '-p'", content)
         self.assertIn("$ClaudeArgs += @('--permission-mode', 'bypassPermissions')", content)
+        self.assertIn("`nCLI exit code:", content)
+        self.assertIn("`nCLI exit code: 127", content)  # command-not-found path writes sentinel
+        self.assertIn("$null -eq $Code", content)  # catch block guards $Code before sentinel
         self.assertIn("Write-NativeChunk", content)
         self.assertIn("Receive-NativeStreamChunk", content)
         self.assertIn("Invoke-StreamingNativeProcess", content)
@@ -131,6 +134,8 @@ class CliWindowTests(unittest.TestCase):
         self.assertNotIn("2>&1", content)
         self.assertIn("Codex completed without creating the expected output file", content)
         self.assertIn("if ($Code -eq 0) { $Code = 1 }", content)
+        self.assertIn("`nCLI exit code: 127", content)  # command-not-found path writes sentinel
+        self.assertIn("$null -eq $Code", content)  # catch block guards $Code before sentinel
 
     def test_launch_uses_argv_and_not_shell_true(self):
         fake_process = mock.Mock(spec=subprocess.Popen)

@@ -887,6 +887,20 @@ def _terminal_metadata(task_store, task, client: str) -> dict[str, Any]:
     exists = log_path.is_file()
     active = (task.activeClient == client) and (task.status in RUNNING_TASK_STATUSES)
     mtime = log_path.stat().st_mtime if exists else None
+
+    exit_code = None
+    finished = False
+    if exists:
+        content = log_path.read_text(encoding="utf-8", errors="replace")
+        for line in reversed(content.splitlines()):
+            m = re.match(r"^CLI exit code:\s*(-?\d+)\s*$", line)
+            if not m and not active:
+                m = re.search(r"CLI exit code:\s*(-?\d+)\s*$", line)
+            if m:
+                exit_code = int(m.group(1))
+                finished = True
+                break
+
     return {
         "taskId": task.id,
         "client": client,
@@ -897,6 +911,9 @@ def _terminal_metadata(task_store, task, client: str) -> dict[str, Any]:
         "status": task.status,
         "active": active,
         "updatedAt": datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z") if mtime else None,
+        "finished": finished,
+        "exitCode": exit_code,
+        "lastLogUpdateAt": datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z") if mtime else None,
     }
 
 
@@ -907,6 +924,7 @@ def _terminal_stream(task_store, task_id: str, client: str, wfile, flush):
     task = task_store.load(task_id)
     log_path = _resolve_terminal_log(task_store, task, client)
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    line_buffer = ""  # rolling buffer for incomplete last line across reads
     while True:
         current_size = log_path.stat().st_size if log_path.is_file() else 0
         if current_size > sent_bytes:
@@ -919,17 +937,27 @@ def _terminal_stream(task_store, task_id: str, client: str, wfile, flush):
                 payload = json.dumps({"chunk": chunk, "offset": sent_bytes, "done": False}, ensure_ascii=False)
                 wfile.write(f"data: {payload}\n\n".encode("utf-8"))
                 flush()
-            if "CLI exit code:" in chunk:
-                # Flush any bytes remaining in the decoder before closing
-                tail = decoder.decode(b"", final=True)
-                if tail:
-                    payload = json.dumps({"chunk": tail, "offset": sent_bytes, "done": False}, ensure_ascii=False)
+                # Check complete lines for the CLI exit sentinel
+                combined = line_buffer + chunk
+                lines = combined.split("\n")
+                line_buffer = lines.pop()  # keep incomplete last line for next iteration
+                exit_code_detected = None
+                for line in lines:
+                    m = re.match(r"^CLI exit code:\s*(-?\d+)\s*$", line)
+                    if m:
+                        exit_code_detected = int(m.group(1))
+                        break
+                if exit_code_detected is not None:
+                    # Flush any bytes remaining in the decoder before closing
+                    tail = decoder.decode(b"", final=True)
+                    if tail:
+                        payload = json.dumps({"chunk": tail, "offset": sent_bytes, "done": False}, ensure_ascii=False)
+                        wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                        flush()
+                    payload = json.dumps({"chunk": "", "offset": sent_bytes, "done": True, "exitCode": exit_code_detected}, ensure_ascii=False)
                     wfile.write(f"data: {payload}\n\n".encode("utf-8"))
                     flush()
-                payload = json.dumps({"chunk": "", "offset": sent_bytes, "done": True}, ensure_ascii=False)
-                wfile.write(f"data: {payload}\n\n".encode("utf-8"))
-                flush()
-                return
+                    return
         elif not waiting_sent:
             waiting_sent = True
             payload = json.dumps({"chunk": "", "offset": 0, "done": False, "waiting": True}, ensure_ascii=False)
