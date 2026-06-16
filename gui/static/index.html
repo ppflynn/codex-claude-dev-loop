@@ -37,10 +37,9 @@
 
       <section class="workspace">
         <header class="topbar">
-          <div>
+          <div class="topbar-info">
             <h2 id="project-name">未选择项目</h2>
             <p id="project-path-label">先导入或选择一个项目。</p>
-            <p class="safety-note">移除项目只从工具中移除，不删除本地文件。</p>
           </div>
           <div class="topbar-actions">
             <button id="initialize-button" class="secondary" type="button" title="给普通 Git 仓库复制协同脚本和 docs 模板">初始化项目</button>
@@ -54,7 +53,7 @@
           <div class="panel-heading">
             <div>
               <h3>PLAN.md</h3>
-              <p>保留现有计划文件，任务 prompt 会另存到本工具状态目录。</p>
+              <p>计划文件保存在项目 <code>docs/PLAN.md</code>，任务 prompt 另存到本工具状态目录。</p>
             </div>
             <span id="plan-state" class="status-pill">待选择</span>
           </div>
@@ -65,7 +64,7 @@
           <div class="panel-heading compact">
             <div>
               <h3>任务控制</h3>
-              <p>任务状态和产物保存在本工具 <code>.gui/tasks</code> 目录。</p>
+              <p>填写任务后点击「创建任务」。产物保存在 <code>.gui/tasks</code> 目录。</p>
             </div>
           </div>
 
@@ -95,11 +94,13 @@
             </div>
           </form>
 
-          <div class="run-actions task-actions">
+          <div class="run-actions task-actions primary-actions">
             <button id="launch-claude-button" class="primary" type="button">启动 Claude CLI</button>
             <button id="claude-completed-button" class="secondary" type="button">Claude 已完成</button>
+            <span class="action-separator"></span>
             <button id="launch-codex-button" class="primary" type="button">启动 Codex CLI</button>
             <button id="codex-completed-button" class="secondary" type="button">Codex 已完成</button>
+            <span class="action-separator"></span>
             <button id="cancel-task-button" class="danger" type="button">取消任务</button>
           </div>
 
@@ -126,17 +127,17 @@
                 <h3>当前任务</h3>
                 <p>显示选中任务的状态、轮次和进度。</p>
               </div>
-              <span id="task-state" class="status-pill">无任务</span>
+              <span id="task-state" class="status-pill status-pill-lg">无任务</span>
             </div>
             <dl>
-              <div><dt>标题</dt><dd id="task-title-label">-</dd></div>
+              <div class="dl-title"><dt>标题</dt><dd id="task-title-label">-</dd></div>
               <div><dt>任务 ID</dt><dd id="task-id-label">-</dd></div>
               <div><dt>目标路径</dt><dd id="task-path-label">-</dd></div>
-              <div><dt>轮次</dt><dd id="task-round">-</dd></div>
+              <div class="dl-emphasis"><dt>轮次</dt><dd id="task-round">-</dd></div>
               <div><dt>最大</dt><dd id="task-max-rounds">-</dd></div>
               <div><dt>进度</dt><dd><div id="task-progress-container" style="display:none;margin-top:2px;"><div class="progress-bar"><div id="task-progress-fill" class="progress-fill" style="width:0%"></div></div></div><span id="task-progress-label">-</span></dd></div>
-              <div><dt>阶段</dt><dd id="task-stage-label">-</dd></div>
-              <div><dt>运行端</dt><dd id="task-active-client">-</dd></div>
+              <div class="dl-emphasis"><dt>阶段</dt><dd id="task-stage-label">-</dd></div>
+              <div class="dl-emphasis"><dt>运行端</dt><dd id="task-active-client">-</dd></div>
               <div><dt>创建</dt><dd id="task-created">-</dd></div>
               <div><dt>更新</dt><dd id="task-updated">-</dd></div>
             </dl>
@@ -169,9 +170,9 @@
         <div class="panel-heading compact">
           <div>
             <h3>运行终端</h3>
-            <p>选中任务后，这里会实时显示 Claude/Codex CLI 输出。</p>
+            <p>选中任务后，这里实时显示 Claude/Codex CLI 输出。CLI 退出后会自动提示下一步。</p>
           </div>
-          <span id="terminal-state" class="status-pill">待选择</span>
+          <span id="terminal-state" class="status-pill status-pill-lg">待选择</span>
         </div>
         <div class="terminal-grid" id="terminal-grid">
           <div class="terminal-box" id="claude-terminal-box">

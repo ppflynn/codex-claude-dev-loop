@@ -19,6 +19,7 @@ const taskStatusLabels = {
   BLOCKED: "阻塞",
   FAILED: "失败",
   CANCELLED: "已取消",
+  IDLE: "无任务",
 };
 
 const clientLabels = {
@@ -816,7 +817,7 @@ function renderTaskDetails() {
   $("task-created").textContent = task?.createdAt || "-";
   $("task-updated").textContent = task?.lastActivityAt || task?.updatedAt || "-";
 
-  const stageLabel = task?.stage ? (stageLabels[task.stage] || task.stage) : "-";
+  const stageLabel = labelStage(task?.stage);
   $("task-stage-label").textContent = stageLabel;
 
   const progress = task?.progress != null ? `${task.progress}%` : "-";
@@ -1139,6 +1140,16 @@ async function restoreTrashTask() {
 
 function labelStatus(status) {
   return taskStatusLabels[status] || status || "-";
+}
+
+// server.py emits task.stage = f"fix_round_{next_round}" when Codex returns NEEDS_FIX,
+// so resolve those dynamically instead of showing the raw key.
+function labelStage(stage) {
+  if (!stage) return "-";
+  if (stageLabels[stage]) return stageLabels[stage];
+  const m = /^fix_round_(\d+)$/.exec(stage);
+  if (m) return `第 ${m[1]} 轮修复`;
+  return stage;
 }
 
 function statusClass(status) {

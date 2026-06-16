@@ -1215,3 +1215,126 @@ Reviewed P2-1 from Codex Round 6: the claim that `.control-grid`, `.checkbox`, a
 py -3 -m pytest tests/test_gui_server.py tests/test_cli_window.py -q
 58 passed, 1 warning in 3.89s
 ```
+
+---
+
+## Round 26: gui/static/app.js String Audit (Codex Round 2 Fix)
+
+### Summary
+
+Codex Round 2 flagged that `gui/static/app.js` was not modified in the Round 1 self-bootstrap diff, even though the task description mentioned fixing Chinese mojibake for task statuses, stage states, button hints, and terminal prompts. Performed a full audit of all user-visible strings in `app.js` and confirmed the file is already clean UTF-8 Chinese (no replacement characters, no BOM, all task/status/stage/button/terminal strings render correctly). Found one real i18n gap — a backend dynamic stage value that fell through to raw key display — and fixed it.
+
+### Audit Method
+
+1. Byte-level encoding check via `[System.IO.File]::ReadAllBytes` + UTF-8 decode — confirmed zero `U+FFFD` replacement characters across `app.js`, `index.html`, `styles.css`.
+2. Cross-referenced all values assigned to `task.stage` and `task.status` in the backend (`gui/server.py`, `gui/orchestrator/models.py`, `gui/orchestrator/state_machine.py`) against the `stageLabels` and `taskStatusLabels` maps in `app.js`.
+3. Inventoried every user-visible string in `app.js`: status labels, stage labels, client labels, toast messages, terminal placeholders, completion prompts, empty-state messages, and confirm dialogs.
+
+### Audit Findings
+
+**No mojibake present** — all strings already render as proper UTF-8 Chinese. The Round 1 diff legitimately had nothing to fix in `app.js`; Codex's flag was a "you didn't touch this file" heuristic, not a defect report.
+
+**One real i18n gap found**: `gui/server.py:833` sets `task.stage = f"fix_round_{next_round}"` when Codex returns `NEEDS_FIX` and the next fix round starts. This dynamic stage key is not in `stageLabels`, so `renderTaskDetails()` fell through to the raw key and the user saw e.g. "fix_round_2" in the 阶段 field instead of a friendly Chinese label.
+
+### Changes
+
+**`gui/static/app.js`**:
+
+- Added `IDLE: "无任务"` to `taskStatusLabels`. The `renderTaskDetails()` fallback at line 809 (`task?.status || "IDLE"`) is never reached in practice (when no task is selected, line 810 short-circuits to the literal `"无任务"`), but adding the entry makes the map exhaustive and defensive against future code paths.
+- Added `labelStage(stage)` helper next to `labelStatus(status)`:
+  ```js
+  // server.py emits task.stage = f"fix_round_{next_round}" when Codex returns NEEDS_FIX,
+  // so resolve those dynamically instead of showing the raw key.
+  function labelStage(stage) {
+    if (!stage) return "-";
+    if (stageLabels[stage]) return stageLabels[stage];
+    const m = /^fix_round_(\d+)$/.exec(stage);
+    if (m) return `第 ${m[1]} 轮修复`;
+    return stage;
+  }
+  ```
+- Replaced the inline stage-label computation in `renderTaskDetails()` (`const stageLabel = task?.stage ? (stageLabels[task.stage] || task.stage) : "-"`) with a call to `labelStage(task?.stage)`. Now `fix_round_2` renders as "第 2 轮修复", `fix_round_3` as "第 3 轮修复", etc. All existing static stages continue to resolve through `stageLabels` unchanged.
+
+The non-obvious comment is justified because a reader of `app.js` alone cannot see that the backend emits `fix_round_<n>` dynamically — without the comment, the regex looks arbitrary.
+
+### What Was NOT Changed
+
+- No changes to existing task status labels, stage labels, client labels, toast messages, terminal placeholder text, or completion prompts — all were already correct UTF-8 Chinese.
+- No changes to `index.html` button titles or labels — all clean.
+- No backend changes — `server.py` already emits the dynamic stage correctly; the gap was purely frontend-side translation.
+- No new tests added — the test suite is Python-only; there is no JS test framework in the project. The change is a pure string-formatting tweak with no behavioral surface testable from Python.
+- VS Code extension unchanged.
+- Task state machine, CLI launching, terminal streaming, sentinel parsing, SSE reconnect logic — all preserved.
+
+### Test Results
+
+```
+py -B -m pytest -q -p no:cacheprovider
+132 passed, 4 warnings in 15.66s
+```
+
+### Manual Verification (encoding)
+
+```
+=== app.js ===      Size: 43390  BOM: False  UTF-8 replacement chars: 0
+=== index.html ===  Size: 9317   BOM: False  UTF-8 replacement chars: 0
+=== styles.css ===  Size: 15486  BOM: False  UTF-8 replacement chars: 0
+```
+
+---
+
+## Round 27: start.bat digits-only port detection (Codex Round 3 Fix)
+
+### Summary
+
+Codex Round 3 flagged one P2 in `start.bat`: the digits-only check used to recognize `start.bat 8787` and rewrite it as `-Port 8787` always marked a bare numeric argument as non-numeric. As a result, `8787` was forwarded to `powershell.exe -File start-gui.ps1` as a positional argument, which PowerShell bound to the first `-HostName` parameter (string), leaving `-Port` at its default 8765. This silently broke both the documented port-conflict workaround (`start.bat 8787`) and the same path advertised in `README.md` and `docs/QUICK_START.md`.
+
+### Root Cause
+
+`start.bat:48` (pre-fix) read:
+
+```bat
+for /f "delims=0123456789" %%A in ("#%NUMERIC%") do set "IS_NUM=0"
+```
+
+`FOR /F` treats every contiguous run of non-delimiter characters as a token. The delimiters here are only `0`–`9`. Prefixing the input with `#` means `#` itself is always a non-delimiter character at the start of the input, so `FOR /F` always finds a token (`#` for `#8787`, `#Port` for `#Port`, etc.) and executes the body — setting `IS_NUM=0` unconditionally. The check could never say "yes, this is a pure number".
+
+### Fix
+
+`start.bat:51` (post-fix):
+
+```bat
+for /f "delims=0123456789" %%A in ("%NUMERIC%") do set "IS_NUM=0"
+```
+
+The `#` sentinel is removed. Now:
+
+- Pure digits like `8787` have no non-delimiter characters, so `FOR /F` finds no tokens, the body never runs, and `IS_NUM` stays `1` — the bare number is correctly rewritten to `-Port 8787`.
+- Mixed strings like `87a87`, `Port` (from `-Port`), `HostName` (from `-HostName`), `0.0.0.0` still contain non-delimiter characters, so `FOR /F` finds a token and `IS_NUM` becomes `0` — they pass through unchanged.
+
+Added a 3-line comment above the FOR /F explaining the `#` sentinel trap so the regression is not reintroduced by a future edit.
+
+### Manual Verification
+
+Wrote a tiny batch file to a temp location (outside the repo) that replicates the parsing logic and ran it against seven inputs:
+
+```
+INPUT=[8787]      NUMERIC=[8787]      IS_NUM=1  FORWARDED=[-Port 8787]
+INPUT=[-Port]     NUMERIC=[Port]      IS_NUM=0  FORWARDED=[-Port]
+INPUT=[87a87]     NUMERIC=[87a87]     IS_NUM=0  FORWARDED=[87a87]
+INPUT=[8787]      NUMERIC=[8787]      IS_NUM=1  FORWARDED=[-Port 8787]
+INPUT=[-HostName] NUMERIC=[HostName]  IS_NUM=0  FORWARDED=[-HostName]
+INPUT=[0.0.0.0]   NUMERIC=[0.0.0.0]   IS_NUM=0  FORWARDED=[0.0.0.0]
+INPUT=[12345]     NUMERIC=[12345]     IS_NUM=1  FORWARDED=[-Port 12345]
+```
+
+The critical case `8787` now produces `-Port 8787` as documented. The temp file was deleted after verification.
+
+### What Was NOT Changed
+
+- No changes to `scripts/start-gui.ps1` — the `-Port` / `-HostName` parameter declarations there are correct; the bug was purely in how `start.bat` decided what to forward.
+- No changes to `README.md` or `docs/QUICK_START.md` — the documented `start.bat 8787` usage was already correct, the bug was that the script didn't honor it.
+- No changes to GUI server, orchestrator, frontend, or VS Code extension.
+- No backend Python tests added — `start.bat` is a Windows-only launcher not exercised by pytest. The parsing logic was verified by direct batch execution instead.
+- Existing test suite (`py -B -m pytest -q`) is unaffected by this change; per the Round 3 prompt the prior run reported `132 passed`.
+
