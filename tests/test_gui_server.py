@@ -198,6 +198,12 @@ class TaskApiCoreTests(unittest.TestCase):
         prompt = (task_dir / "CODEX_REVIEW_PROMPT.md").read_text(encoding="utf-8")
         self.assertIn("Do not edit files. The launcher will save your final response", prompt)
         self.assertNotIn("Write the final structured review JSON", prompt)
+        # Runtime Terminal Progress Protocol must be injected into the Codex prompt
+        self.assertIn("Runtime Terminal Progress Protocol", prompt)
+        self.assertIn("::task-status{phase=\"<phase>\" message=\"<message>\"}", prompt)
+        # Codex final response must remain pure JSON
+        self.assertIn("single JSON object", prompt)
+        self.assertIn("MUST NOT contain `::task-status` events", prompt)
 
     def test_codex_pass_enters_terminal_pass(self):
         _root, _project, project_store, task_store = self.make_project_store()
@@ -1208,6 +1214,125 @@ class TerminalApiTests(unittest.TestCase):
             handler.do_GET()
             self.assertEqual(handler._status, 200)
             self.assertIn("text/event-stream", handler._content_type())
+
+    def test_terminal_stream_status_events_do_not_mask_exit_code(self):
+        """`::task-status{...}` lines must not interfere with `CLI exit code:` sentinel detection."""
+        from unittest import mock as umock
+
+        _root, task_store, task = self.make_store_and_task()
+        task.status = Status.CLAUDE_WINDOW_STARTED
+        task.round = 1
+        task_store.save(task)
+
+        log_path = task_store.task_dir(task.id) / "claude_window_round_1.log"
+        # Include an event with escaped quotes / backslashes (per protocol) so
+        # the SSE stream is exercised against the escape rules the JS parser
+        # must tolerate.
+        log_path.write_text(
+            "::task-status{phase=\"editing\" message=\"Fixing bug\"}\n"
+            "::task-status{phase=\"testing\" message=\"Running pytest\"}\n"
+            "::task-status{phase=\"editing\" message=\"He said \\\"hi\\\" and \\\\path\"}\n"
+            "CLI exit code: 0\n",
+            encoding="utf-8",
+        )
+
+        wfile = _FakeWfile(None)
+
+        def flush():
+            pass
+
+        with umock.patch("time.sleep", lambda _: None):
+            server._terminal_stream(task_store, task.id, "claude", wfile, flush)
+
+        output = b"".join(wfile._buf).decode("utf-8")
+        chunks = []
+        done_payload = None
+        for line in output.splitlines():
+            if line.startswith("data: "):
+                data = json.loads(line[6:])
+                if data.get("chunk"):
+                    chunks.append(data["chunk"])
+                if data.get("done"):
+                    done_payload = data
+                    break
+        self.assertIsNotNone(done_payload)
+        # Status events streamed through unchanged — UI parses them client-side
+        combined = "".join(chunks)
+        self.assertIn("::task-status{phase=\"editing\" message=\"Fixing bug\"}", combined)
+        self.assertIn("::task-status{phase=\"testing\" message=\"Running pytest\"}", combined)
+        # Escaped quotes / backslashes must survive server-side forwarding
+        # verbatim so the JS escaped-string regex can match them.
+        self.assertIn('::task-status{phase="editing" message="He said \\"hi\\" and \\\\path"}', combined)
+        # Exit code sentinel still detected on its own line
+        self.assertTrue(done_payload["done"])
+        self.assertEqual(done_payload["exitCode"], 0)
+
+    def test_terminal_stream_forwards_content_without_trailing_newline(self):
+        """A CLI chunk that does not end in `\\n` (prompts, progress bars) must
+        still be forwarded by the SSE stream so the xterm renderer can display
+        it in real time. The JS chunk processor is responsible for streaming
+        such partial lines straight to xterm instead of buffering them."""
+        from unittest import mock as umock
+
+        _root, task_store, task = self.make_store_and_task()
+        task.status = Status.CLAUDE_WINDOW_STARTED
+        task.round = 1
+        task_store.save(task)
+
+        log_path = task_store.task_dir(task.id) / "claude_window_round_1.log"
+        # Include carriage-return progress updates (no `\n` between them), an
+        # unterminated partial line, then the sentinel on its own `\n`-delimited
+        # line so the server can detect it and close the stream. write_bytes
+        # avoids Windows text-mode newline translation so the `\r` characters
+        # reach the SSE stream verbatim.
+        log_path.write_bytes(
+            (
+                "Building... 42%\rBuilding... 87%\r\n"
+                "Partial output without newline"
+                "\nCLI exit code: 0\n"
+            ).encode("utf-8")
+        )
+
+        wfile = _FakeWfile(None)
+
+        def flush():
+            pass
+
+        with umock.patch("time.sleep", lambda _: None):
+            server._terminal_stream(task_store, task.id, "claude", wfile, flush)
+
+        output = b"".join(wfile._buf).decode("utf-8")
+        chunks = []
+        done_payload = None
+        for line in output.splitlines():
+            if line.startswith("data: "):
+                data = json.loads(line[6:])
+                if data.get("chunk"):
+                    chunks.append(data["chunk"])
+                if data.get("done"):
+                    done_payload = data
+                    break
+        self.assertIsNotNone(done_payload)
+        combined = "".join(chunks)
+        # Carriage-return progress updates and the unterminated "Partial output"
+        # fragment must be forwarded so the client can stream them to xterm
+        # instead of buffering until the next newline arrives.
+        self.assertIn("Building... 42%\rBuilding... 87%\r\n", combined)
+        self.assertIn("Partial output without newline", combined)
+        self.assertTrue(done_payload["done"])
+        self.assertEqual(done_payload["exitCode"], 0)
+
+    def test_terminal_metadata_handles_status_event_lines(self):
+        """Metadata should still detect CLI exit code even when status events precede it."""
+        _root, task_store, task = self.make_store_and_task()
+        log_path = task_store.task_dir(task.id) / "claude_window_round_1.log"
+        log_path.write_text(
+            "::task-status{phase=\"done\" message=\"Finished\"}\nCLI exit code: 0\n",
+            encoding="utf-8",
+        )
+        meta = server._terminal_metadata(task_store, task, "claude")
+        self.assertTrue(meta["finished"])
+        self.assertEqual(meta["exitCode"], 0)
 
 
 def _make_handler(method, path, body=None):
