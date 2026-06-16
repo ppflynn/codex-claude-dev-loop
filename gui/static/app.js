@@ -73,9 +73,46 @@ const VSCodeTerminalTheme = {
 };
 
 const terminalInstances = {
-  claude: { term: null, fitAddon: null, observer: null, hasOutput: false },
-  codex: { term: null, fitAddon: null, observer: null, hasOutput: false },
+  claude: { term: null, fitAddon: null, observer: null, hasOutput: false, lineBuffer: "", phase: "" },
+  codex: { term: null, fitAddon: null, observer: null, hasOutput: false, lineBuffer: "", phase: "" },
 };
+
+const phaseLabels = {
+  planning: "计划中",
+  reading: "读取中",
+  running: "运行中",
+  editing: "修改中",
+  testing: "验证中",
+  reviewing: "审查中",
+  writing: "写入中",
+  waiting: "等待中",
+  blocked: "已阻塞",
+  done: "完成",
+};
+
+const phaseBadgeClasses = {
+  planning: "terminal-phase-badge planning",
+  reading: "terminal-phase-badge reading",
+  running: "terminal-phase-badge running",
+  editing: "terminal-phase-badge editing",
+  testing: "terminal-phase-badge testing",
+  reviewing: "terminal-phase-badge reviewing",
+  writing: "terminal-phase-badge writing",
+  waiting: "terminal-phase-badge waiting",
+  blocked: "terminal-phase-badge blocked",
+  done: "terminal-phase-badge done",
+};
+
+// Matches a single complete `::task-status{phase="..." message="..."}` line.
+// The message capture uses an escaped-string pattern so `\"` and `\\` inside
+// the message do not terminate the capture prematurely.
+const TASK_STATUS_RE = /^::task-status\{\s*phase="([^"]*)"(?:\s+message="((?:\\.|[^"\\])*)")?\s*\}\s*$/;
+
+// Status-event lines must begin with this prefix on their own line. We only
+// buffer partial chunks that could grow into a status event; everything else
+// streams straight to xterm so progress bars / prompts / carriage-return
+// updates render in real time.
+const STATUS_EVENT_PREFIX = "::task-status";
 
 let taskRefreshTimer = null;
 let loadGeneration = 0;
@@ -109,7 +146,7 @@ function createTerminal(client) {
   });
   observer.observe(container);
 
-  terminalInstances[client] = { term, fitAddon, observer, hasOutput: false };
+  terminalInstances[client] = { term, fitAddon, observer, hasOutput: false, lineBuffer: "", phase: "" };
   return term;
 }
 
@@ -125,6 +162,9 @@ function destroyTerminal(client) {
   }
   inst.fitAddon = null;
   inst.hasOutput = false;
+  inst.lineBuffer = "";
+  inst.phase = "";
+  clearTerminalPhaseBadge(client);
 }
 
 function destroyAllTerminals() {
@@ -136,6 +176,135 @@ function writeToTerminal(client, text) {
   const term = terminalInstances[client].term;
   if (term) {
     term.write(text);
+  }
+}
+
+function unescapeStatusMessage(raw) {
+  // The protocol allows \\" and \\\\ inside the message. Decode them back.
+  return String(raw || "")
+    .replace(/\r/g, "")
+    .replace(/\\(.)/g, (_, ch) => ch);
+}
+
+function renderStatusLine(client, phase, message) {
+  const term = terminalInstances[client].term;
+  if (!term) return;
+  const label = phaseLabels[phase] || phase || "状态";
+  // Strip any ANSI escapes from the message so user-supplied text cannot
+  // reformat the terminal unexpectedly.
+  const safeMessage = String(message || "").replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
+  const line = safeMessage
+    ? `\x1b[36m\x1b[1m[${label}]\x1b[0m \x1b[37m${safeMessage}\x1b[0m`
+    : `\x1b[36m\x1b[1m[${label}]\x1b[0m`;
+  term.write(line + "\r\n");
+}
+
+function updateTerminalPhaseBadge(client, phase) {
+  const box = document.getElementById(`${client}-terminal-box`);
+  if (!box) return;
+  const title = box.querySelector(".terminal-title");
+  if (!title) return;
+
+  let badge = title.querySelector(".terminal-phase-badge");
+  if (!badge) {
+    badge = document.createElement("span");
+    title.appendChild(badge);
+  }
+  const label = phaseLabels[phase] || phase || "";
+  badge.textContent = label;
+  badge.className = phaseBadgeClasses[phase] || "terminal-phase-badge";
+  // The base CSS rule sets `display: none`. Override it explicitly here so
+  // the badge becomes visible; the empty-string fallback would inherit the
+  // hidden base state and the badge would never appear.
+  badge.style.display = label ? "inline-flex" : "none";
+}
+
+function clearTerminalPhaseBadge(client) {
+  const box = document.getElementById(`${client}-terminal-box`);
+  if (!box) return;
+  const title = box.querySelector(".terminal-title");
+  if (!title) return;
+  const badge = title.querySelector(".terminal-phase-badge");
+  if (badge) {
+    badge.textContent = "";
+    badge.className = "terminal-phase-badge";
+    badge.style.display = "none";
+  }
+}
+
+function couldBeStatusEventPrefix(line) {
+  // True when `line` could still grow into a `::task-status{...}` event:
+  // either it is a prefix of the sentinel ("::", "::ta", "::task-status" ...)
+  // or it already starts with the sentinel and may continue into `{...}`.
+  if (!line) return false;
+  return STATUS_EVENT_PREFIX.startsWith(line) || line.startsWith(STATUS_EVENT_PREFIX);
+}
+
+function processTerminalChunk(client, text) {
+  const inst = terminalInstances[client];
+  const term = inst && inst.term;
+  if (!term || typeof text !== "string" || text.length === 0) return;
+
+  // Combine any buffered partial status-event line with the new text. The
+  // buffer only ever holds a line that could grow into a status event, so
+  // ordinary CLI output is never delayed here.
+  const combined = inst.lineBuffer + text;
+  inst.lineBuffer = "";
+
+  // Split on \n. The last element is the trailing partial line (no \n).
+  const lines = combined.split("\n");
+  const trailing = lines.pop();
+
+  for (let i = 0; i < lines.length; i++) {
+    const rawLine = lines[i];
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    const m = TASK_STATUS_RE.exec(line);
+    if (m) {
+      const phase = m[1] || "";
+      const message = unescapeStatusMessage(m[2] || "");
+      renderStatusLine(client, phase, message);
+      if (phase) {
+        inst.phase = phase;
+        updateTerminalPhaseBadge(client, phase);
+      }
+    } else {
+      // Preserve embedded \r (carriage-return updates) by writing the raw
+      // line; xterm with convertEol handles the trailing newline.
+      term.write(rawLine + "\r\n");
+    }
+  }
+
+  // Trailing partial line: only buffer if it could grow into a status event.
+  // Otherwise stream it to xterm immediately so non-newline output such as
+  // prompts, progress bars, and token-style updates render in real time.
+  if (trailing) {
+    if (couldBeStatusEventPrefix(trailing)) {
+      inst.lineBuffer = trailing;
+    } else {
+      term.write(trailing);
+    }
+  }
+}
+
+function flushTerminalBuffer(client) {
+  const inst = terminalInstances[client];
+  if (!inst || !inst.lineBuffer) return;
+  const pending = inst.lineBuffer;
+  inst.lineBuffer = "";
+  const term = inst.term;
+  if (!term) return;
+  const trimmed = pending.endsWith("\r") ? pending.slice(0, -1) : pending;
+  const m = TASK_STATUS_RE.exec(trimmed);
+  if (m) {
+    const phase = m[1] || "";
+    const message = unescapeStatusMessage(m[2] || "");
+    renderStatusLine(client, phase, message);
+    if (phase) {
+      inst.phase = phase;
+      updateTerminalPhaseBadge(client, phase);
+    }
+  } else if (pending.length > 0) {
+    term.write(pending);
   }
 }
 
@@ -174,6 +343,15 @@ function connectTerminal(client) {
   terminalConnections[client].source = es;
 
   es.onmessage = (event) => {
+    // Stale-stream guard: if this EventSource was already replaced (reconnect,
+    // task switch, etc.), discard its queued message before it can reach the
+    // chunk processor — otherwise it would resolve `terminalInstances[client]`
+    // at call time and write into the new active terminal, duplicating or
+    // reordering output and updating the new terminal's phase badge.
+    if (terminalConnections[client].source !== es) {
+      es.close();
+      return;
+    }
     const current = selectedTask();
     if (!current || current.id !== taskId || current.round !== taskRound) {
       es.close();
@@ -194,10 +372,11 @@ function connectTerminal(client) {
           term.reset();
           terminalInstances[client].hasOutput = true;
         }
-        term.write(data.chunk);
+        processTerminalChunk(client, data.chunk);
       }
       if (data.done) {
         if (terminalConnections[client].source === es) {
+          flushTerminalBuffer(client);
           terminalConnections[client].done = true;
           if (data.exitCode != null) {
             terminalConnections[client].finished = true;
@@ -414,7 +593,8 @@ async function loadTerminalContent(client, taskId, taskRound) {
 
     const logName = meta.logName;
     if (artifacts.artifacts && artifacts.artifacts[logName] && artifacts.artifacts[logName].exists) {
-      term.write(artifacts.artifacts[logName].content);
+      processTerminalChunk(client, artifacts.artifacts[logName].content);
+      flushTerminalBuffer(client);
     }
     terminalInstances[client].hasOutput = true;
     updateTerminalBadges();

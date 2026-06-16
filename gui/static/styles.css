@@ -676,6 +676,64 @@ textarea:focus {
   color: #fff;
 }
 
+/* ---- Runtime terminal phase badge ---- */
+
+.terminal-title .terminal-phase-badge {
+  display: none;
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: #2d2d2d;
+  color: #cccccc;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+
+.terminal-title .terminal-phase-badge.planning,
+.terminal-title .terminal-phase-badge.reading {
+  background: #1f3a5f;
+  color: #c8dafa;
+  border-color: #3b6fb0;
+}
+
+.terminal-title .terminal-phase-badge.editing,
+.terminal-title .terminal-phase-badge.writing {
+  background: #4a3a1a;
+  color: #f5d68a;
+  border-color: #9a6a16;
+}
+
+.terminal-title .terminal-phase-badge.running,
+.terminal-title .terminal-phase-badge.testing {
+  background: #1f4a35;
+  color: #b6e6cf;
+  border-color: #2f8a5d;
+}
+
+.terminal-title .terminal-phase-badge.reviewing {
+  background: #3a2a52;
+  color: #d8c4f5;
+  border-color: #6b3f8a;
+}
+
+.terminal-title .terminal-phase-badge.waiting {
+  background: #2d2d2d;
+  color: #cccccc;
+  border-color: #555555;
+}
+
+.terminal-title .terminal-phase-badge.blocked {
+  background: #4a1f1f;
+  color: #f5b6b6;
+  border-color: #a64035;
+}
+
+.terminal-title .terminal-phase-badge.done {
+  background: #1f4a35;
+  color: #b6e6cf;
+  border-color: #2f8a5d;
+}
+
 .terminal-output {
   min-height: 0;
   overflow: hidden;
