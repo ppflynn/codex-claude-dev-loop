@@ -1167,6 +1167,37 @@ function worktreeTypeClass(worktreeType) {
   return "";
 }
 
+let inspectorOverlayBackdrop = null;
+
+function toggleInspector() {
+  const inspector = document.querySelector(".inspector");
+  if (!inspector) return;
+
+  if (inspector.classList.contains("overlay")) {
+    inspector.classList.remove("overlay");
+    if (inspectorOverlayBackdrop) {
+      inspectorOverlayBackdrop.remove();
+      inspectorOverlayBackdrop = null;
+    }
+  } else {
+    inspector.classList.add("overlay");
+    const backdrop = document.createElement("div");
+    backdrop.className = "overlay-backdrop";
+    backdrop.addEventListener("click", toggleInspector);
+    document.body.appendChild(backdrop);
+    inspectorOverlayBackdrop = backdrop;
+  }
+}
+
+function switchInspectorTab(tab) {
+  document.querySelectorAll(".inspector-tab").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.tab === tab);
+  });
+  document.querySelectorAll(".inspector-panel").forEach((panel) => {
+    panel.classList.toggle("active", panel.id === `inspector-${tab}`);
+  });
+}
+
 function escapeHtml(value) {
   return String(value)
     .replaceAll("&", "&amp;")
@@ -1180,6 +1211,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("add-project-form").addEventListener("submit", addProject);
   $("initialize-button").addEventListener("click", initializeProject);
   $("remove-project-button").addEventListener("click", removeProject);
+  $("toggle-inspector-button").addEventListener("click", toggleInspector);
   $("save-plan-button").addEventListener("click", savePlan);
   $("task-form").addEventListener("submit", createTask);
   $("launch-claude-button").addEventListener("click", () => taskAction("launch-claude", "Claude CLI 窗口已启动"));
@@ -1194,6 +1226,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("active-tasks-tab").addEventListener("click", () => setTaskView("active"));
   $("archived-tasks-tab").addEventListener("click", () => setTaskView("archived"));
   $("trash-tasks-tab").addEventListener("click", () => setTaskView("trash"));
+  document.querySelectorAll(".inspector-tab").forEach((btn) => {
+    btn.addEventListener("click", () => switchInspectorTab(btn.dataset.tab));
+  });
   renderTaskDetails();
   renderArtifacts();
   await loadProjects();

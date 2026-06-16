@@ -68,7 +68,7 @@ class GuiServerTests(unittest.TestCase):
         self.assertEqual(command[:5], ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
         self.assertIn(str(root / "scripts" / "run-claude.ps1"), command)
         self.assertIn("-MaxRounds", command)
-        self.assertEqual(command[command.index("-MaxRounds") + 1], "10")
+        self.assertEqual(command[command.index("-MaxRounds") + 1], "15")
         self.assertIn("-SkipTests", command)
         self.assertIn("-AllowNoTests", command)
         self.assertIn("-SkipCodexReview", command)

@@ -8,7 +8,7 @@
     Generates structured artifacts: git status, git diff, test results, and review schema.
     All execution output is saved to docs/claude-run.log with secret redaction.
 .PARAMETER MaxRounds
-    Maximum number of Claude fix rounds (default: 3, range: 1-10)
+    Maximum number of Claude fix rounds (default: 3, range: 1-15)
 .PARAMETER SkipTests
     Skip automatic test execution (useful for manual verification)
 .PARAMETER AllowNoTests
@@ -29,7 +29,7 @@
 #>
 
 param(
-    [ValidateRange(1, 10)]
+    [ValidateRange(1, 15)]
     [int]$MaxRounds = 3,
     [switch]$SkipTests = $false,
     [switch]$AllowNoTests = $false,

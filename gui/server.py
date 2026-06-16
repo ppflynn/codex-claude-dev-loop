@@ -185,7 +185,7 @@ def clamp_max_rounds(value: Any) -> int:
         parsed = int(value)
     except (TypeError, ValueError):
         parsed = 3
-    return max(1, min(10, parsed))
+    return max(1, min(15, parsed))
 
 
 def build_run_command(project_path: Path, options: dict[str, Any]) -> list[str]:
