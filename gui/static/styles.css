@@ -317,18 +317,39 @@ textarea:focus {
   justify-content: space-between;
   gap: 16px;
   min-height: 48px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.topbar-info {
+  min-width: 0;
+  flex: 1;
 }
 
 .topbar h2 {
   margin: 0;
   font-size: 20px;
   letter-spacing: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .topbar-actions,
 .run-actions {
   display: flex;
   gap: 8px;
+}
+
+.action-separator {
+  width: 1px;
+  align-self: stretch;
+  background: var(--line);
+  margin: 2px 0;
+}
+
+.primary-actions {
+  align-items: center;
 }
 
 /* ---- Editor panel ---- */
@@ -411,6 +432,19 @@ textarea:focus {
   flex-wrap: wrap;
 }
 
+.task-actions.primary-actions {
+  background: var(--panel-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px;
+  gap: 6px;
+}
+
+.task-actions.primary-actions > button {
+  min-height: 38px;
+  font-weight: 650;
+}
+
 .lifecycle-actions {
   padding-top: 2px;
   border-top: 1px solid var(--line);
@@ -483,15 +517,47 @@ textarea:focus {
   display: grid;
   grid-template-columns: 72px 1fr;
   gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px dashed transparent;
+}
+
+.run-status dl div.dl-title {
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--line);
+}
+
+.run-status dl div.dl-emphasis {
+  background: var(--panel-soft);
+  border-radius: 6px;
+  padding: 6px 8px;
+  margin: 0 -4px;
+}
+
+.run-status dl div.dl-emphasis dt {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.run-status dl div.dl-emphasis dd {
+  font-weight: 600;
+  color: var(--text);
 }
 
 .run-status dt {
   color: var(--muted);
+  font-size: 12px;
 }
 
 .run-status dd {
   margin: 0;
   word-break: break-word;
+  font-size: 13px;
+}
+
+.run-status dl div.dl-title dd {
+  font-weight: 650;
+  font-size: 14px;
+  color: var(--text);
 }
 
 /* ---- Inspector: history & artifacts shared ---- */
@@ -672,6 +738,14 @@ textarea:focus {
   color: var(--muted);
   font-size: 12px;
   white-space: nowrap;
+}
+
+.status-pill.status-pill-lg {
+  min-width: 88px;
+  height: 28px;
+  padding: 0 12px;
+  font-size: 13px;
+  font-weight: 650;
 }
 
 .status-pill.running {
