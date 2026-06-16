@@ -181,8 +181,8 @@ Test-Start "MAX_ROUNDS configuration is present and bounded"
 
 if ($scriptContent -match 'MaxRounds' -and $scriptContent -match 'MAX_ROUNDS') {
     # Check range validation
-    if ($scriptContent -match 'ValidateRange\(1,\s*10\)') {
-        Test-Pass "MAX_ROUNDS has 1-10 range validation"
+    if ($scriptContent -match 'ValidateRange\(1,\s*15\)') {
+        Test-Pass "MAX_ROUNDS has 1-15 range validation"
     } else {
         Test-Pass "MAX_ROUNDS variable found"
     }

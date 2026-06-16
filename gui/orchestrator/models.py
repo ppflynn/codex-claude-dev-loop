@@ -102,7 +102,7 @@ class Task:
             testCommand=test_command.strip(),
             status="CREATED",
             round=1,
-            maxRounds=max(1, min(10, int(max_rounds))),
+            maxRounds=max(1, min(15, int(max_rounds))),
             createdAt=now,
             updatedAt=now,
         )

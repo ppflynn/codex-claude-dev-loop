@@ -12,18 +12,7 @@
       <aside class="sidebar">
         <div class="brand">
           <h1>Agent 协同控制台</h1>
-          <p>本地任务、可见 CLI 窗口、Git/Test/Codex 审查闭环。</p>
         </div>
-
-        <section class="quick-guide">
-          <h2>协同流程</h2>
-          <ol>
-            <li><strong>创建任务</strong><span>写标题、目标和验收标准。</span></li>
-            <li><strong>Claude 实现</strong><span>启动可见 Claude CLI 窗口。</span></li>
-            <li><strong>Codex 审查</strong><span>收集 Git/Test 后启动 Codex CLI。</span></li>
-            <li><strong>生命周期</strong><span>归档、恢复、移入工具回收站。</span></li>
-          </ol>
-        </section>
 
         <form id="add-project-form" class="add-project">
           <label for="project-path">导入项目目录</label>
@@ -31,10 +20,19 @@
             <input id="project-path" name="path" type="text" autocomplete="off" placeholder="例如：E:\work\my-project">
             <button type="submit" title="导入项目">导入</button>
           </div>
-          <p class="field-help">项目会写入本工具的 `.gui/projects.json` 白名单。</p>
+          <p class="field-help">项目会写入本工具的 <code>.gui/projects.json</code> 白名单。</p>
         </form>
 
         <div class="project-list" id="project-list"></div>
+
+        <div class="sidebar-section task-sidebar">
+          <div class="task-view-toggle" role="tablist" aria-label="任务列表视图">
+            <button id="active-tasks-tab" type="button">当前</button>
+            <button id="archived-tasks-tab" type="button">已归档</button>
+            <button id="trash-tasks-tab" type="button">回收站</button>
+          </div>
+          <div class="task-list" id="task-list"></div>
+        </div>
       </aside>
 
       <section class="workspace">
@@ -47,24 +45,10 @@
           <div class="topbar-actions">
             <button id="initialize-button" class="secondary" type="button" title="给普通 Git 仓库复制协同脚本和 docs 模板">初始化项目</button>
             <button id="save-plan-button" class="secondary" type="button" title="保存 PLAN.md">保存 PLAN</button>
+            <button id="toggle-inspector-button" class="ghost" type="button" title="显示/隐藏详情检查器">详情</button>
             <button id="remove-project-button" class="danger" type="button" title="只移除工具中的项目注册记录">移除项目</button>
           </div>
         </header>
-
-        <section class="role-strip">
-          <div>
-            <span>网页端</span>
-            <strong>创建任务 / 推进状态</strong>
-          </div>
-          <div>
-            <span>Claude CLI</span>
-            <strong>实现 / 修复</strong>
-          </div>
-          <div>
-            <span>Codex CLI</span>
-            <strong>审查 / 输出 JSON</strong>
-          </div>
-        </section>
 
         <section class="editor-panel">
           <div class="panel-heading">
@@ -81,7 +65,7 @@
           <div class="panel-heading compact">
             <div>
               <h3>任务控制</h3>
-              <p>任务状态和产物保存在本工具 `.gui/tasks` 目录。</p>
+              <p>任务状态和产物保存在本工具 <code>.gui/tasks</code> 目录。</p>
             </div>
           </div>
 
@@ -105,7 +89,7 @@
               </label>
               <label>
                 最大轮次
-                <input id="task-max-rounds-input" type="number" min="1" max="10" value="3">
+                <input id="task-max-rounds-input" type="number" min="1" max="15" value="3">
               </label>
               <button id="create-task-button" class="primary" type="submit">创建任务</button>
             </div>
@@ -129,71 +113,47 @@
       </section>
 
       <aside class="inspector">
-        <section class="run-status">
-          <div class="panel-heading">
-            <div>
-              <h3>当前任务</h3>
-              <p>显示选中任务的状态、轮次和历史。</p>
-            </div>
-            <span id="task-state" class="status-pill">无任务</span>
-          </div>
-          <dl>
-            <div><dt>标题</dt><dd id="task-title-label">-</dd></div>
-            <div><dt>任务 ID</dt><dd id="task-id-label">-</dd></div>
-            <div><dt>目标路径</dt><dd id="task-path-label">-</dd></div>
-            <div><dt>轮次</dt><dd id="task-round">-</dd></div>
-            <div><dt>最大</dt><dd id="task-max-rounds">-</dd></div>
-            <div><dt>进度</dt><dd><div id="task-progress-container" style="display:none;margin-top:2px;"><div class="progress-bar"><div id="task-progress-fill" class="progress-fill" style="width:0%"></div></div></div><span id="task-progress-label">-</span></dd></div>
-            <div><dt>阶段</dt><dd id="task-stage-label">-</dd></div>
-            <div><dt>运行端</dt><dd id="task-active-client">-</dd></div>
-            <div><dt>创建</dt><dd id="task-created">-</dd></div>
-            <div><dt>更新</dt><dd id="task-updated">-</dd></div>
-          </dl>
-        </section>
+        <div class="inspector-tabs" role="tablist" aria-label="详情面板">
+          <button class="inspector-tab active" data-tab="status">当前任务</button>
+          <button class="inspector-tab" data-tab="history">历史</button>
+          <button class="inspector-tab" data-tab="artifacts">产物</button>
+        </div>
 
-        <section class="runtime-terminal-panel" id="runtime-terminal-panel">
+        <div class="inspector-panel active" id="inspector-status">
+          <section class="run-status">
+            <div class="panel-heading">
+              <div>
+                <h3>当前任务</h3>
+                <p>显示选中任务的状态、轮次和进度。</p>
+              </div>
+              <span id="task-state" class="status-pill">无任务</span>
+            </div>
+            <dl>
+              <div><dt>标题</dt><dd id="task-title-label">-</dd></div>
+              <div><dt>任务 ID</dt><dd id="task-id-label">-</dd></div>
+              <div><dt>目标路径</dt><dd id="task-path-label">-</dd></div>
+              <div><dt>轮次</dt><dd id="task-round">-</dd></div>
+              <div><dt>最大</dt><dd id="task-max-rounds">-</dd></div>
+              <div><dt>进度</dt><dd><div id="task-progress-container" style="display:none;margin-top:2px;"><div class="progress-bar"><div id="task-progress-fill" class="progress-fill" style="width:0%"></div></div></div><span id="task-progress-label">-</span></dd></div>
+              <div><dt>阶段</dt><dd id="task-stage-label">-</dd></div>
+              <div><dt>运行端</dt><dd id="task-active-client">-</dd></div>
+              <div><dt>创建</dt><dd id="task-created">-</dd></div>
+              <div><dt>更新</dt><dd id="task-updated">-</dd></div>
+            </dl>
+          </section>
+        </div>
+
+        <div class="inspector-panel" id="inspector-history">
           <div class="panel-heading compact">
             <div>
-              <h3>运行终端</h3>
-              <p>选中任务后，这里会实时显示 Claude/Codex CLI 输出。</p>
-            </div>
-            <span id="terminal-state" class="status-pill">待选择</span>
-          </div>
-          <div class="terminal-grid" id="terminal-grid">
-            <div class="terminal-box" id="claude-terminal-box">
-              <div class="terminal-title">
-                <span>Claude CLI</span>
-                <span></span>
-              </div>
-              <div id="claude-output" class="terminal-output"></div>
-            </div>
-            <div class="terminal-box" id="codex-terminal-box">
-              <div class="terminal-title">
-                <span>Codex CLI</span>
-                <span></span>
-              </div>
-              <div id="codex-output" class="terminal-output"></div>
-            </div>
-          </div>
-        </section>
-
-        <section class="terminal-panel">
-          <div class="panel-heading">
-            <div>
               <h3>任务历史</h3>
-              <p>状态推进、校验失败和生命周期操作会记录在这里。</p>
+              <p>状态推进、校验失败和生命周期操作记录。</p>
             </div>
           </div>
           <pre id="task-history"></pre>
-          <div class="task-view-toggle" role="tablist" aria-label="任务列表视图">
-            <button id="active-tasks-tab" type="button">当前</button>
-            <button id="archived-tasks-tab" type="button">已归档</button>
-            <button id="trash-tasks-tab" type="button">回收站</button>
-          </div>
-          <div class="task-list" id="task-list"></div>
-        </section>
+        </div>
 
-        <section class="artifact-panel">
+        <div class="inspector-panel" id="inspector-artifacts">
           <div class="panel-heading compact">
             <div>
               <h3>任务产物</h3>
@@ -202,8 +162,34 @@
           </div>
           <div class="tabs" id="artifact-tabs"></div>
           <pre id="artifact-content"></pre>
-        </section>
+        </div>
       </aside>
+
+      <section class="bottom-terminal" id="runtime-terminal-panel">
+        <div class="panel-heading compact">
+          <div>
+            <h3>运行终端</h3>
+            <p>选中任务后，这里会实时显示 Claude/Codex CLI 输出。</p>
+          </div>
+          <span id="terminal-state" class="status-pill">待选择</span>
+        </div>
+        <div class="terminal-grid" id="terminal-grid">
+          <div class="terminal-box" id="claude-terminal-box">
+            <div class="terminal-title">
+              <span>Claude CLI</span>
+              <span></span>
+            </div>
+            <div id="claude-output" class="terminal-output"></div>
+          </div>
+          <div class="terminal-box" id="codex-terminal-box">
+            <div class="terminal-title">
+              <span>Codex CLI</span>
+              <span></span>
+            </div>
+            <div id="codex-output" class="terminal-output"></div>
+          </div>
+        </div>
+      </section>
     </main>
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>

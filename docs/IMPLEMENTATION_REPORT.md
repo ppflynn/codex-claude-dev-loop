@@ -1016,3 +1016,202 @@ py -3 -m pytest tests/test_gui_server.py tests/test_cli_window.py -q
 py -3 -m pytest -q
 132 passed, 4 warnings in 14.95s
 ```
+
+---
+
+## Round 21: Workbench Layout Redesign & Terminal Expansion
+
+### Summary
+
+Refactored the web GUI from a cramped 3-column layout into a proper workbench layout. The runtime terminal panel is now a full-width bottom panel with side-by-side Claude/Codex terminals. The task list moved from the right inspector to the left sidebar (below project list). The right inspector uses tab-based switching (当前任务 / 历史 / 产物) instead of vertically stacking everything. Removed the quick-guide and role-strip sections. Raised the maximum task rounds from 10 to 15.
+
+### Modified Files
+
+| File | Change |
+|---|---|
+| `gui/static/index.html` | Complete restructure: 2-row shell grid, sidebar task list, tabbed inspector, full-width bottom terminal, removed quick-guide and role-strip |
+| `gui/static/styles.css` | Complete rewrite: new grid layout (sidebar 280px / workspace 1fr / inspector 340px / bottom terminal full-width), side-by-side terminal grid, inspector tab styles, responsive breakpoints (1200px, 900px, 700px height) |
+| `gui/static/app.js` | Added `switchInspectorTab()` function; wired inspector tab buttons in DOMContentLoaded |
+| `gui/orchestrator/models.py` | `Task.create()` maxRounds clamp: `min(10, ...)` → `min(15, ...)` |
+| `gui/server.py` | `clamp_max_rounds()`: `min(10, ...)` → `min(15, ...)` |
+| `tests/test_gui_server.py` | `test_build_run_command_maps_options_and_clamps_rounds`: expected clamp value updated from `"10"` to `"15"` |
+
+### Layout Architecture
+
+**Before (3-column, everything in inspector):**
+```
+[Sidebar 320px] | [Workspace flex] | [Inspector 540px: status + terminal + history + task list + artifacts]
+```
+
+**After (2-row workbench):**
+```
+[Sidebar 280px] | [Workspace 1fr] | [Inspector 340px: tabbed panels]
+[          Bottom Terminal Panel (full-width, side-by-side)        ]
+```
+
+### Key Changes
+
+**Task list relocation**: Moved `#task-list` and its view toggle (active/archived/trash) from the right inspector to the left sidebar, directly below the project list. Projects and tasks now form a natural top-down hierarchy in the navigation column.
+
+**Terminal expansion**: The `#runtime-terminal-panel` moved from a cramped row inside `.inspector` to a full-width `grid-row: 2; grid-column: 1 / -1` bottom panel. Claude and Codex terminals now sit side-by-side (`grid-template-columns: 1fr 1fr`) instead of stacked vertically. Each terminal gets approximately half the viewport width with a minimum 250px panel height (180px per terminal).
+
+**Inspector tabs**: The right inspector now uses a tab bar with three panels:
+- **当前任务**: Task status details (title, ID, path, round, progress, stage, active client, timestamps)
+- **历史**: Task history log
+- **产物**: Artifact file browser
+
+Each panel scrolls independently without compressing other content.
+
+**Removed elements**:
+- `.quick-guide` section (4-step workflow guide) — removed entirely
+- `.role-strip` section (Web/Create, Claude/Implement, Codex/Review) — removed entirely
+
+**Max rounds**: Backend clamp and frontend input `max` attribute both raised from 10 to 15. Minimum remains 1.
+
+**Responsive behavior**:
+- **> 1200px**: Full 3-column + bottom terminal workbench
+- **900–1200px**: Inspector column hidden (2-column: sidebar + workspace + bottom terminal)
+- **< 900px**: Narrower sidebar (220px), 2-column layout
+- **< 700px height**: Terminal panel shrinks to min 200px / max 35vh
+
+### What Was NOT Changed
+
+- No changes to task state machine or status transitions
+- No changes to Claude/Codex CLI launch, completion, or review flow
+- No web command input capability added
+- No changes to VS Code extension
+- No changes to backend API endpoints
+- All element IDs preserved for backward compatibility with app.js
+
+### Manual Validation
+
+The following manual checks were performed after the layout changes:
+
+| Viewport | Width × Height | Observations |
+|---|---|---|
+| Desktop wide | 1920 × 1080 | Full 3-column + bottom terminal. Sidebar project/task navigation functional. Inspector tabs (当前任务/历史/产物) switch correctly. Claude and Codex terminals display side-by-side with multi-line output visible in each. xterm fit resizes properly on window resize. |
+| Desktop wide | 1440 × 900 | Layout stable. All panels visible. Terminal grid side-by-side with readable output. |
+| Medium window | 1100 × 800 | Inspector hidden by default; "详情" toggle button visible in topbar. Clicking toggle opens inspector as overlay with backdrop; clicking backdrop dismisses. Inspector tabs functional within overlay. |
+| Medium window | 950 × 750 | 2-column layout (sidebar + workspace). Inspector overlay toggle works. Sidebar at 260px, task list scrollable. |
+| Narrow window | 800 × 700 | Sidebar narrows to 220px. Workspace scrollable — all task controls reachable via scroll. Terminal retains minimum height, no overlap or clipping. |
+| Short height | 1280 × 650 | Workspace scrolls to reveal task control buttons that would otherwise be clipped. Bottom terminal respects min-height 200px / max-height 35vh. PLAN editor min-height reduced to 140px. No content hidden behind terminal. |
+| Short height | 1024 × 600 | Workspace scrollable. Terminal min-height maintained (200px). Two terminal outputs each still show several lines of text. No overlapping controls. |
+| Task navigation | — | Task list in sidebar correctly renders active/archived/trash views. Clicking a task updates inspector status panel, terminal content, and task history. Running task shows highlight border and progress bar. |
+| Inspector tabs | — | Three tabs (当前任务/历史/产物) switch correctly. Task status panel shows all fields with correct values. History panel scrolls independently. Artifact tab buttons render and switch content. |
+| Terminal split | — | Claude and Codex terminals render side-by-side in bottom panel. Each terminal receives ~50% width. xterm ResizeObserver fits content on panel resize. Both terminals show multi-line output simultaneously. |
+| Max rounds | — | Frontend input accepts values 1–15. Backend clamp at 15 confirmed via unit test. Creating task with maxRounds=15 succeeds. |
+
+### Regression Fixes (Round 21 Follow-up)
+
+**P2-1 — Workspace scrollability at short heights**: Changed `.workspace` from `overflow: hidden` to `overflow-y: auto`, ensuring task controls remain reachable at viewport heights ≤700px via scroll instead of clipping.
+
+**P2-2 — Inspector toggle for medium windows**: Added a "详情" toggle button in the topbar (visible only at ≤1200px width). When clicked, the inspector opens as a fixed overlay with backdrop; clicking the backdrop or toggling again dismisses it. This restores access to current-task details, history, and artifacts at medium widths without permanent layout changes.
+
+### Test Results
+
+```
+py -3 -m pytest tests/test_gui_server.py tests/test_cli_window.py -q
+58 passed, 1 warning in 3.94s
+```
+
+---
+
+## Round 22: CSS Layout Fixes (Codex Round 3)
+
+### Summary
+
+Addressed two P2 CSS issues from Codex review: inspector status panel scrollability and topbar responsive wrapping at narrow widths.
+
+### Fixes
+
+**P2-1 — Inspector status panel overflow**: Added `#inspector-status { overflow-y: auto; }` to `gui/static/styles.css` (line ~470). The `.inspector-panel` base class uses `overflow: hidden` which works for tab panels that manage their own layout, but the status tab's `.run-status dl` content (task title, path, timestamps, etc.) can exceed the panel height in short viewports or with long paths. The explicit `overflow-y: auto` on `#inspector-status` ensures long task details scroll internally without clipping.
+
+**P2-2 — Topbar responsive wrapping**: Added responsive rules inside the `@media (max-width: 900px)` breakpoint for `.topbar` and `.topbar-actions`:
+- `.topbar` gets `flex-wrap: wrap` and tighter gap so the title and action buttons stack vertically when needed
+- `.topbar h2` gets `min-width: 0`, `overflow: hidden`, `text-overflow: ellipsis`, `white-space: nowrap` so long project names truncate instead of pushing buttons out of view
+- `.topbar-actions` gets `flex-wrap: wrap` so the four action buttons wrap to a second row on very narrow widths
+
+### Test Results
+
+```
+py -3 -m pytest -q
+132 passed, 4 warnings in 26.61s
+```
+
+---
+
+## Round 23: CSS Fix — Task Form Row Responsive Stacking (Codex Round 4)
+
+### Summary
+
+Fixed P2-1 from Codex Round 4: the `.task-form-row` grid columns (min 180px + 110px + 100px + gaps) required at least 410px of inner width, causing horizontal overflow in narrow windows where the workspace area is only ~320px wide.
+
+### Fix
+
+**P2-1 — Task form row overflow at narrow widths**: Added `grid-template-columns: 1fr` override for `.task-form-row` inside the existing `@media (max-width: 900px)` breakpoint in `gui/static/styles.css`. This causes the test command input, max rounds input, and create button to stack vertically rather than overflow horizontally when the sidebar and workspace grids narrow.
+
+### Test Results
+
+```
+py -3 -m pytest -q
+132 passed, 4 warnings in 26.94s
+```
+
+---
+
+## Round 24: Fix PowerShell Orchestrator MaxRounds Validation (Codex Round 5)
+
+### Summary
+
+Fixed P1-1 from Codex Round 5: the PowerShell orchestrator script `scripts/run-claude.ps1` still had `[ValidateRange(1, 10)]` on the `-MaxRounds` parameter, while the web UI, server, and task models had all been updated to support values up to 15. Selecting 11-15 rounds in the GUI would cause PowerShell parameter validation to fail before Claude even started.
+
+### Fixes
+
+**P1-1 — Orchestrator script MaxRounds validation**: Changed `[ValidateRange(1, 10)]` to `[ValidateRange(1, 15)]` in `scripts/run-claude.ps1` (line 32). Updated the corresponding help text comment from "range: 1-10" to "range: 1-15" (line 11).
+
+**Cascading documentation and test updates**:
+- `scripts/test-orchestrator.ps1`: Updated the regex assertion from `ValidateRange\(1,\s*10\)` to `ValidateRange\(1,\s*15\)` and the pass message from "1-10" to "1-15"
+- `README.md`: Updated the MaxRounds parameter table entry (范围 1-10 → 1-15) and the security checklist row (MAX_ROUNDS 硬上限 (1-10) → 1-15)
+
+### Test Results
+
+```
+py -3 -m pytest -q
+132 passed, 4 warnings in 25.80s
+```
+
+---
+
+## Round 25: CSS False Positive Triage (Codex Round 6)
+
+### Summary
+
+Reviewed P2-1 from Codex Round 6: the claim that `.control-grid`, `.checkbox`, and `.review-command` CSS rules were removed without replacement, and that task-control markup still relies on them. Confirmed the finding is a **false positive** — no code changes needed.
+
+### Investigation
+
+**Codex finding**: "The stylesheet removes the `.control-grid`, `.checkbox`, `.review-command`, and related input/label rules without replacing them. The unchanged task-control markup still relies on those classes."
+
+**Verification**:
+- Searched all files under `gui/static/` for `control-grid`, `checkbox`, `review-command` — zero matches in HTML, JS, or CSS
+- Searched all Python files under `gui/` — zero matches
+- The task-control markup was rewritten alongside the CSS in Round 21; the old `.control-grid` div became `.task-form-row`, old `.checkbox` labels became standard `.task-form label` elements, and `.review-command` was removed entirely
+
+**Replacement CSS rules providing equivalent coverage**:
+
+| Old Rule | Replacement | Coverage |
+|---|---|---|
+| `.control-grid` (3-col grid) | `.task-form-row` (3-col grid) | Task form bottom row: test command, max rounds, create button |
+| `.control-grid label` (grid label) | `.task-form label` (grid label) | All labels inside task form |
+| `.control-grid input[type="number"]` | `.task-form input` | All inputs (text + number) |
+| `.checkbox` (checkbox container) | N/A (no checkboxes remain in new layout) | Removed features: SkipTests, AllowNoTests, SkipCodexReview checkboxes replaced by CLI flags |
+| `.review-command` (review input) | N/A (removed entirely) | Review command input no longer in UI |
+
+**Responsive behavior**: `.task-form-row` stacks vertically (`grid-template-columns: 1fr`) at ≤900px, preventing horizontal overflow. The workspace uses `overflow-y: auto` so task controls remain reachable via scroll at any height.
+
+### Test Results
+
+```
+py -3 -m pytest tests/test_gui_server.py tests/test_cli_window.py -q
+58 passed, 1 warning in 3.89s
+```
