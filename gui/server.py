@@ -19,7 +19,24 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
-ROOT = Path(__file__).resolve().parents[1]
+def _resource_root() -> Path:
+    """Return the directory that holds bundled resources.
+
+    Source mode: the repository root (parent of ``gui/``).
+    Frozen mode (PyInstaller): the bundle root, where ``gui/static``,
+    ``scripts``, ``docs`` and ``.claude`` live. ``sys._MEIPASS`` is set
+    by PyInstaller for both onedir and onefile builds and points at the
+    directory containing the extracted/bundled modules and data files.
+    """
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            return Path(meipass)
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[1]
+
+
+ROOT = _resource_root()
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -69,7 +86,15 @@ from gui.orchestrator.test_runner import run_tests
 
 
 STATIC_DIR = ROOT / "gui" / "static"
-STATE_DIR = ROOT / ".gui"
+# Application state directory. Overridable via the ``CCDL_STATE_DIR``
+# environment variable or :func:`configure_paths` so the desktop app can
+# redirect writes to ``%LOCALAPPDATA%\\CodexClaudeDevLoop`` when frozen,
+# while source-mode invocations continue to use the in-repo ``.gui``.
+STATE_DIR: Path = (
+    Path(os.environ["CCDL_STATE_DIR"]).expanduser()
+    if os.environ.get("CCDL_STATE_DIR")
+    else ROOT / ".gui"
+)
 PROJECTS_FILE = STATE_DIR / "projects.json"
 TASKS_DIR = STATE_DIR / "tasks"
 TRASH_TASKS_DIR = STATE_DIR / "trash" / "tasks"
@@ -369,10 +394,31 @@ def clamp_max_rounds(value: Any) -> int:
     return max(1, min(15, parsed))
 
 
+# Executable used to launch the orchestrator PowerShell script. Defaults
+# to ``"powershell"`` (Windows PowerShell 5.x, present on every supported
+# Windows install). The desktop app overrides this via
+# :func:`set_powershell_executable` with whatever it resolved at startup
+# (``powershell.exe`` or ``pwsh.exe``) so the run loop does not break on
+# hosts whose only PowerShell is PowerShell 7 (``pwsh``).
+POWERSHELL_EXECUTABLE: str = "powershell"
+
+
+def set_powershell_executable(path: str | None) -> None:
+    """Override the executable used to drive ``scripts/run-claude.ps1``.
+
+    Pass an absolute path resolved by the desktop app's dependency probe
+    so a host that only has ``pwsh.exe`` (PowerShell 7) on PATH can still
+    launch runs. Passing ``None`` resets to the default ``"powershell"``
+    so legacy source-mode callers see no behaviour change.
+    """
+    global POWERSHELL_EXECUTABLE
+    POWERSHELL_EXECUTABLE = path.strip() if path and path.strip() else "powershell"
+
+
 def build_run_command(project_path: Path, options: dict[str, Any]) -> list[str]:
     script_path = project_path / "scripts" / "run-claude.ps1"
     command = [
-        "powershell",
+        POWERSHELL_EXECUTABLE,
         "-NoProfile",
         "-ExecutionPolicy",
         "Bypass",
@@ -592,6 +638,261 @@ class ProjectStore:
         raise ApiError(HTTPStatus.NOT_FOUND, "Project not found.")
 
 
+class _Win32JobObject:
+    """Best-effort Windows Job Object with kill-on-job-close.
+
+    On Windows 8+ the OS lets us wrap a spawned process (and any
+    descendants it later spawns) in a Job Object whose
+    ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` flag guarantees the whole
+    tree dies when the job handle is closed. This is what
+    :class:`RunManager.stop` needs: terminating the direct PowerShell
+    parent is not enough because Claude / Codex CLI processes spawned
+    by ``scripts/run-claude.ps1`` would otherwise outlive the parent
+    and keep modifying the project after the desktop window has closed.
+
+    The class is intentionally inert on non-Windows hosts and when the
+    ctypes machinery is unavailable so unit tests can run anywhere.
+    Instances are falsy until a real handle is attached.
+    """
+
+    # Win32 constants we need. Defined inline so the module does not
+    # depend on the pywin32 package.
+    _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+    _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+    _PROCESS_SET_QUOTA = 0x0100
+    _PROCESS_TERMINATE = 0x0001
+
+    def __init__(self) -> None:
+        self._kernel32 = None
+        self._handle = None
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+            kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+            kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+            kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+            kernel32.AssignProcessToJobObject.argtypes = [
+                wintypes.HANDLE,
+                wintypes.HANDLE,
+            ]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.OpenProcess.argtypes = [
+                wintypes.DWORD,
+                wintypes.BOOL,
+                wintypes.DWORD,
+            ]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.SetInformationJobObject.restype = wintypes.BOOL
+            kernel32.SetInformationJobObject.argtypes = [
+                wintypes.HANDLE,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                wintypes.DWORD,
+            ]
+
+            # Minimal structure layouts — only the fields we touch are
+            # named; the rest are padding bytes that ctypes sizes for us.
+            class _IO_COUNTERS(ctypes.Structure):
+                _fields_ = [
+                    ("ReadOperationCount", ctypes.c_ulonglong),
+                    ("WriteOperationCount", ctypes.c_ulonglong),
+                    ("OtherOperationCount", ctypes.c_ulonglong),
+                    ("ReadTransferCount", ctypes.c_ulonglong),
+                    ("WriteTransferCount", ctypes.c_ulonglong),
+                    ("OtherTransferCount", ctypes.c_ulonglong),
+                ]
+
+            class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                    ("PerJobUserTimeLimit", ctypes.c_longlong),
+                    ("LimitFlags", wintypes.DWORD),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_void_p),
+                    ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD),
+                ]
+
+            class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                    ("IoInfo", _IO_COUNTERS),
+                    ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t),
+                ]
+
+            handle = kernel32.CreateJobObjectW(None, None)
+            if not handle:
+                return
+            info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            info.BasicLimitInformation.LimitFlags = (
+                self._JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            )
+            ok = kernel32.SetInformationJobObject(
+                handle,
+                self._JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+            )
+            if not ok:
+                kernel32.CloseHandle(handle)
+                return
+            self._kernel32 = kernel32
+            self._handle = handle
+        except (ImportError, AttributeError, OSError):
+            # ctypes missing, weird Windows build, or the calls failed.
+            # Stay inert; RunManager falls back to plain terminate().
+            self._kernel32 = None
+            self._handle = None
+
+    def __bool__(self) -> bool:
+        return self._handle is not None
+
+    def assign(self, process: "subprocess.Popen[Any]") -> bool:
+        """Add ``process`` (and any descendants it spawns) to this job.
+
+        Returns ``True`` on success. Failures are silent — the caller
+        keeps the run going and just loses the tree-kill guarantee.
+        """
+        if not self._handle or self._kernel32 is None:
+            return False
+        try:
+            process_handle = self._kernel32.OpenProcess(
+                self._PROCESS_SET_QUOTA | self._PROCESS_TERMINATE,
+                False,
+                process.pid,
+            )
+            if not process_handle:
+                return False
+            try:
+                return bool(
+                    self._kernel32.AssignProcessToJobObject(
+                        self._handle, process_handle
+                    )
+                )
+            finally:
+                self._kernel32.CloseHandle(process_handle)
+        except (AttributeError, OSError):
+            return False
+
+    def close(self) -> None:
+        """Close the job handle. On Windows this terminates every process
+        still assigned to the job (parent + all descendants)."""
+        if self._kernel32 is None or self._handle is None:
+            return
+        try:
+            self._kernel32.CloseHandle(self._handle)
+        except (AttributeError, OSError):
+            pass
+        finally:
+            self._handle = None
+
+
+class _FileGate:
+    """File-based gate used by the gated Job-aware launcher (P2-2 fix).
+
+    The wrapper process polls for ``path`` to exist via PowerShell
+    ``Test-Path``; the parent creates the file with :meth:`release` only
+    after the wrapper has been successfully added to the Job Object. This
+    guarantees no descendant of the real command can escape the Job.
+    """
+
+    __slots__ = ("path",)
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def release(self) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.touch()
+        except OSError:
+            # Best-effort. If release fails the wrapper will spin until
+            # the process is killed by other means; the Job still owns
+            # it so cleanup is guaranteed.
+            pass
+
+    def cleanup(self) -> None:
+        try:
+            self.path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _create_run_gate() -> _FileGate:
+    """Return a fresh, un-released file gate under the per-user temp dir."""
+    import tempfile
+    import uuid
+
+    gate_dir = Path(tempfile.gettempdir()) / "ccdl-run-gates"
+    return _FileGate(gate_dir / f"gate-{uuid.uuid4().hex}.txt")
+
+
+def _build_gated_run_command(
+    real_command: list[str],
+    gate: _FileGate,
+    *,
+    powershell_executable: str,
+) -> list[str]:
+    """Wrap ``real_command`` so a wrapper process can be added to a Job
+    before the real command spawns any descendants.
+
+    The wrapper is a single ``powershell`` invocation that polls
+    ``Test-Path`` on ``gate.path`` until the parent creates it, then
+    invokes ``real_command`` via the call operator ``&``. Because the
+    call operator starts the real command as a child of the wrapper,
+    the real command (and its own descendants — Claude / Codex CLI)
+    inherit the wrapper's Job membership.
+
+    Each argument is single-quoted for PowerShell with embedded single
+    quotes escaped as ``''`` per PowerShell conventions.
+
+    The wrapper script ends with an explicit ``exit`` that propagates the
+    nested command's ``$LASTEXITCODE``. Without this, Windows PowerShell
+    ``-Command`` does not reliably forward a native child's exit status —
+    e.g. NEEDS_FIX (7) can be collapsed to 1 or 0 by the wrapper, which
+    would make ``exit_code_to_result`` misclassify the run. By reading
+    ``$LASTEXITCODE`` and exiting with it explicitly we guarantee the
+    wrapper process exit code matches the real command's exit code.
+    """
+
+    gate_literal = str(gate.path).replace("'", "''")
+    quoted_args = ["'" + arg.replace("'", "''") + "'" for arg in real_command]
+    real_invocation = "& " + " ".join(quoted_args)
+    # P1-1: capture the nested command's $LASTEXITCODE and exit with it
+    # explicitly. ``$null -eq $LASTEXITCODE`` covers the case where the
+    # real command was a pure cmdlet / script that did not set
+    # $LASTEXITCODE — in that case ``$?`` tells us whether the pipeline
+    # succeeded (exit 0) or failed (exit 1).
+    exit_propagation = (
+        "; $code = $LASTEXITCODE; "
+        "if ($null -eq $code) { if ($?) { exit 0 } else { exit 1 } } "
+        "else { exit $code }"
+    )
+    script = (
+        f"while (-not (Test-Path -LiteralPath '{gate_literal}')) "
+        f"{{ Start-Sleep -Milliseconds 5 }}; {real_invocation}{exit_propagation}"
+    )
+    return [
+        powershell_executable,
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        script,
+    ]
+
+
 class RunManager:
     def __init__(self, store: ProjectStore):
         self.store = store
@@ -600,6 +901,16 @@ class RunManager:
         self.current: dict[str, Any] | None = None
         self._process: subprocess.Popen[str] | None = None
         self._stopping = False
+        # Win32 Job Object that wraps the current run's process tree so
+        # ``stop()`` terminates descendants too. ``None`` when no run is
+        # active or when the Job Object machinery is unavailable.
+        self._job: _Win32JobObject | None = None
+        # Reader thread for the active run. P2-1 fix: ``start()`` refuses
+        # to launch a new run while the previous reader is still alive so
+        # the previous run's finalize (which writes ``current``, clears
+        # ``_process``/``_job`` and closes the captured Job) cannot race
+        # a new run's setup.
+        self._reader_thread: threading.Thread | None = None
 
     def snapshot(self) -> dict[str, Any] | None:
         with self._lock:
@@ -621,6 +932,16 @@ class RunManager:
 
     def start(self, project: dict[str, Any], options: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
+            # P2-1 fix: do not start a new run while the previous run's
+            # reader thread is still alive. The reader finalizes the run
+            # by writing to ``current`` and closing the captured Job; if
+            # we let a new run start now, the old reader's finalize could
+            # overwrite the new run's state or close the wrong Job.
+            if self._reader_thread is not None and self._reader_thread.is_alive():
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    "Previous run is still finalizing; retry in a moment.",
+                )
             if self._process and self._process.poll() is None:
                 raise ApiError(HTTPStatus.CONFLICT, "Another run is already active.")
 
@@ -645,28 +966,147 @@ class RunManager:
             }
             self._stopping = False
 
-            try:
-                self._process = subprocess.Popen(
-                    command,
-                    cwd=str(project_path),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    stdin=subprocess.DEVNULL,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    bufsize=1,
-                )
-            except OSError as exc:
+            # P2-2 fix: prefer the gated Job-aware launcher so the
+            # wrapper process is added to the Job BEFORE it spawns the
+            # real PowerShell command. That way Claude / Codex CLI
+            # descendants of the real command inherit the Job and cannot
+            # escape ``stop()`` / ``shutdown()``. Falls back to plain
+            # ``Popen`` if Job creation or assignment fails.
+            spawn_result = self._spawn_run_process(command, project_path, run_id)
+            if spawn_result is None:
+                # Spawn failed; ``_spawn_run_process`` already recorded
+                # the failure in ``current["logs"]``.
                 self.current["status"] = "failed"
                 self.current["result"] = "START_FAILED"
-                self.current["logs"].append(f"Failed to start process: {exc}")
                 self._condition.notify_all()
-                raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR, f"Failed to start process: {exc}") from exc
+                last_log = self.current["logs"][-1] if self.current["logs"] else "Failed to start process."
+                raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR, last_log)
 
-            self._append_locked(f"Started: {' '.join(command)}")
-            threading.Thread(target=self._read_process, daemon=True).start()
+            process, job, gate = spawn_result
+            self._process = process
+            self._job = job
+
+            self._append_locked(
+                f"Started (gated): {' '.join(command)}"
+                if gate is not None
+                else f"Started: {' '.join(command)}"
+            )
+            # P2-1 fix: pass the per-run state as parameters so the
+            # reader cannot accidentally pollute a newer run. The reader
+            # also gets the gate so it can clean up the gate file once
+            # the run finishes.
+            reader = threading.Thread(
+                target=self._read_process,
+                args=(process, run_id, job, gate),
+                daemon=True,
+                name=f"run-reader-{run_id}",
+            )
+            self._reader_thread = reader
+            reader.start()
             return self.snapshot() or {}
+
+    def _spawn_run_process(
+        self,
+        command: list[str],
+        project_path: Path,
+        run_id: str,
+    ) -> tuple[subprocess.Popen[str], "_Win32JobObject | None", "_FileGate | None"] | None:
+        """Spawn the run process via the gated Job-aware launcher.
+
+        Returns ``(process, job, gate)`` on success. ``job`` and ``gate``
+        are ``None`` when the gated path is unavailable (non-Windows or
+        Job creation/assignment failure) and the launcher falls back to
+        plain ``Popen``. Returns ``None`` if even the fallback spawn
+        fails; in that case the failure is appended to ``current["logs"]``
+        so the caller can surface it.
+        """
+        popen_kwargs: dict[str, Any] = {
+            "cwd": str(project_path),
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "stdin": subprocess.DEVNULL,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "bufsize": 1,
+        }
+
+        # P2-2: try the gated launcher whenever a real Job Object is
+        # available. ``_Win32JobObject`` is inert (returns a falsy
+        # placeholder) on non-Windows hosts and when ``ctypes`` is
+        # missing, so the truthiness check below naturally falls
+        # through to plain ``Popen`` on those platforms.
+        try:
+            job = _Win32JobObject()
+        except Exception:
+            job = None
+        if job:
+            gate = _create_run_gate()
+            gated_command = _build_gated_run_command(
+                command,
+                gate,
+                powershell_executable=POWERSHELL_EXECUTABLE,
+            )
+            try:
+                wrapper_process = subprocess.Popen(gated_command, **popen_kwargs)
+            except OSError as exc:
+                self._append_locked(
+                    f"Gated launcher spawn failed ({exc}); falling back to plain launch."
+                )
+                gate.cleanup()
+                job.close()
+                gate = None
+                job = None
+            else:
+                # Assign the WRAPPER to the Job BEFORE releasing the
+                # gate. The real command (and its descendants) are
+                # spawned by the wrapper after the gate is released,
+                # so they inherit the Job.
+                if job.assign(wrapper_process):
+                    gate.release()
+                    self._append_locked(
+                        "Gated launcher: wrapper added to Job, gate released."
+                    )
+                    return wrapper_process, job, gate
+                # Assign failed — terminate the suspended wrapper, wait
+                # briefly, and on timeout escalate to ``kill()`` before
+                # cleaning up. P2-2: previously the wait timeout was
+                # swallowed, leaving the wrapper spinning on a gate
+                # file we immediately delete. The wrapper would never
+                # see the gate, never exit, and the fallback plain
+                # ``Popen`` would start a second unrelated process —
+                # leaking a background PowerShell outside the Job
+                # lifecycle.
+                self._append_locked(
+                    "Gated launcher: Job assignment failed; falling back to plain launch."
+                )
+                try:
+                    wrapper_process.terminate()
+                except Exception:
+                    pass
+                try:
+                    wrapper_process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    try:
+                        wrapper_process.kill()
+                    except Exception:
+                        pass
+                    try:
+                        wrapper_process.wait(timeout=2)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                gate.cleanup()
+                job.close()
+
+        # Plain Popen fallback (non-Windows or gated launch failed).
+        try:
+            process = subprocess.Popen(command, **popen_kwargs)
+        except OSError as exc:
+            self._append_locked(f"Failed to start process: {exc}")
+            return None
+        return process, None, None
 
     def stop(self) -> dict[str, Any]:
         with self._lock:
@@ -675,15 +1115,168 @@ class RunManager:
             self._stopping = True
             self._append_locked("Stop requested.")
             process = self._process
+            job = self._job
 
-        process.terminate()
         try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            with self._lock:
-                self._append_locked("Process did not stop in time; killed.")
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                with self._lock:
+                    self._append_locked("Process did not stop in time; killed.")
+        finally:
+            # Closing the job handle terminates every descendant still
+            # assigned to it (Claude / Codex CLI children spawned by the
+            # PowerShell wrapper). This is the P2-1 fix: terminating the
+            # direct PowerShell parent alone is not enough on Windows.
+            # The ``finally`` guarantees the close still runs even if
+            # ``terminate`` or ``wait`` raises — otherwise descendants
+            # could outlive the parent and continue modifying the
+            # project after the user has stopped the run.
+            if job:
+                try:
+                    job.close()
+                except Exception:
+                    pass
+                with self._lock:
+                    if self._job is job:
+                        self._job = None
         return self.snapshot() or {}
+
+    def has_active_run(self) -> bool:
+        """Return True iff a child process is currently running."""
+        with self._lock:
+            return bool(self._process and self._process.poll() is None)
+
+    def stop_if_running(self) -> bool:
+        """Stop the active run if one exists. Idempotent.
+
+        Returns ``True`` when an active run was terminated (or at least
+        attempted). Returns ``False`` when no run was active at the time
+        of the call, so callers driving a shutdown path (e.g. the desktop
+        app's ``stop_backend``) can invoke this unconditionally without
+        distinguishing the "nothing to stop" case up front.
+
+        Race window: the child may exit between the precondition check
+        and ``stop()``. ``stop()`` would then raise ``ApiError`` (CONFLICT),
+        which we treat as "no run needed stopping" since the process is
+        gone anyway.
+
+        Note: this method only closes the Job Object when the direct
+        parent process is still alive. Callers that need to guarantee
+        descendant cleanup even when the parent has already exited
+        (e.g. desktop shutdown) should prefer :meth:`shutdown`.
+        """
+        if not self.has_active_run():
+            return False
+        try:
+            self.stop()
+            return True
+        except ApiError:
+            return False
+
+    def shutdown(self) -> bool:
+        """Forcefully stop the active run and release the Job Object handle.
+
+        Unlike :meth:`stop_if_running`, this method does NOT gate on
+        :meth:`has_active_run`. It unconditionally closes any open Job
+        Object handle so descendants are reaped even when:
+
+        * The PowerShell parent process has already exited but a
+          descendant (Claude / Codex CLI) is still running inside the
+          Job Object.
+        * The reader thread is still blocked on inherited stdout and
+          has not yet reached its natural-exit ``job.close()`` call.
+
+        This is the P2-1 fix for the desktop shutdown path: because
+        ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` only fires when the job
+        handle is closed, leaving ``self._job`` open would allow
+        descendants to outlive the desktop window and HTTP server.
+
+        Round 8 P2-1: ``_stopping`` is set whenever there is an open Job
+        OR a live wrapper process, not only when the wrapper is alive.
+        When the wrapper has already exited but descendants are still
+        running inside the Job, the reader thread can still be blocked
+        on the inherited stdout pipe those descendants hold open; closing
+        the Job kills them, the pipe closes, and the reader finalizes the
+        wrapper's exit code. Without ``_stopping`` the reader would
+        classify the run as ``finished``/``SUCCESS`` even though the user
+        explicitly requested a stop — misreporting an aborted
+        project-modifying run as a successful completion and updating
+        ``lastResult`` incorrectly. ``_append_locked`` notifies the
+        condition so any SSE consumer waiting on the run state wakes up
+        and observes the stop request.
+
+        Returns ``True`` when work was performed (a process was
+        terminated or a Job handle was closed); ``False`` when there
+        was nothing to clean up. Safe to call repeatedly — once the
+        job is cleared, subsequent calls are no-ops.
+        """
+        with self._lock:
+            process = self._process
+            job = self._job
+            process_alive = bool(
+                process is not None and process.poll() is None
+            )
+            if process_alive or job is not None:
+                self._stopping = True
+                self._append_locked("Shutdown requested.")
+
+        try:
+            if process_alive and process is not None:
+                try:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        with self._lock:
+                            self._append_locked(
+                                "Process did not stop in time; killed."
+                            )
+                except Exception:
+                    # Terminate / wait / kill are best-effort. The
+                    # finally below still closes the job so descendants
+                    # are reaped even if the parent refused to die.
+                    pass
+        finally:
+            # Close the Job handle UNCONDITIONALLY so descendants are
+            # reaped even when the parent has already exited but a
+            # child is still running inside the Job, or the reader
+            # thread has not yet reached its natural-exit close().
+            if job:
+                try:
+                    job.close()
+                except Exception:
+                    pass
+                with self._lock:
+                    # Only clear if it hasn't been replaced by a new run
+                    # in the meantime (defensive — extremely unlikely).
+                    if self._job is job:
+                        self._job = None
+
+        return process_alive or job is not None
+
+    def shutdown_and_snapshot(self) -> dict[str, Any] | None:
+        """Stop the active run, close the Job Object handle unconditionally,
+        and return the current run snapshot.
+
+        Used by the HTTP stop endpoint so a user pressing the web UI Stop
+        button gets descendants reaped even when the direct wrapper
+        process has already exited (which would make :meth:`stop` refuse
+        with a 409 CONFLICT). Without this routing, a wrapper that has
+        exited while Claude / Codex CLI children keep running inside the
+        Job would leave the run visible as "running" until the whole
+        desktop app exits.
+
+        Returns the snapshot at the moment of the call. The reader
+        thread may still finalize ``current`` afterwards; callers that
+        need a stable terminal snapshot should rely on the SSE stream
+        or the next ``GET /api/runs/current`` poll.
+        """
+        self.shutdown()
+        return self.snapshot()
 
     def stream_events(self, last_index: int = 0):
         while True:
@@ -725,33 +1318,123 @@ class RunManager:
         with self._lock:
             self._append_locked(line)
 
-    def _read_process(self) -> None:
-        process = self._process
+    def _read_process(
+        self,
+        process: subprocess.Popen[str],
+        run_id: str,
+        job: "_Win32JobObject | None",
+        gate: "_FileGate | None",
+    ) -> None:
+        """Per-run reader thread body.
+
+        P2-1 fix: takes the run's process / id / Job / gate as parameters
+        so the reader only ever mutates state that still belongs to this
+        run. If a newer run has replaced ``self.current`` /
+        ``self._process`` / ``self._job`` while this reader was reading
+        stdout or waiting on the process, the reader still:
+
+        * Appends stdout lines ONLY while ``self.current.id == run_id``.
+        * Finalizes ``self.current`` / writes ``lastResult`` to the
+          project ONLY when it still owns ``self.current``.
+        * Clears ``self._process`` / ``self._job`` ONLY when those
+          fields still point at this run's captured objects.
+        * Closes THIS run's captured Job regardless (the Job Object
+          itself is idempotent so this is safe even if ``stop()`` /
+          ``shutdown()`` already closed it).
+
+        Every blocking call (``stdout`` iteration, ``stdout.close()``,
+        ``process.wait()``, ``store.update_project``) is wrapped so
+        transient failures are logged into the run's history instead of
+        escaping as ``PytestUnhandledThreadExceptionWarning``.
+        """
+        # --- stdout drain ---------------------------------------------------
         if process and process.stdout:
             try:
                 for line in process.stdout:
-                    self._append(line)
+                    with self._lock:
+                        # Only append while this run still owns ``current``.
+                        # A newer run that started after our process exited
+                        # would otherwise have its logs polluted.
+                        if self.current and self.current.get("id") == run_id:
+                            self._append_locked(line)
+            except Exception as exc:
+                with self._lock:
+                    if self.current and self.current.get("id") == run_id:
+                        self._append_locked(f"stdout read error: {exc}")
             finally:
-                process.stdout.close()
-        exit_code = process.wait() if process else None
+                try:
+                    process.stdout.close()
+                except Exception as exc:
+                    with self._lock:
+                        if self.current and self.current.get("id") == run_id:
+                            self._append_locked(f"stdout close error: {exc}")
+
+        # --- wait -----------------------------------------------------------
+        exit_code: int | None = None
+        try:
+            exit_code = process.wait() if process else None
+        except Exception as exc:
+            # P2-1 fix: do not let wait() failures escape as background
+            # thread exceptions. Record the failure into the run's
+            # history (when we still own it) and proceed with
+            # ``exit_code=None`` so the finalize path runs.
+            with self._lock:
+                if self.current and self.current.get("id") == run_id:
+                    self._append_locked(f"wait error: {exc}")
+
+        # --- finalize -------------------------------------------------------
         with self._lock:
             stopped = self._stopping
-            result = exit_code_to_result(exit_code, stopped=stopped)
-            if self.current:
+            owns_current = bool(self.current and self.current.get("id") == run_id)
+            if owns_current:
+                result = exit_code_to_result(exit_code, stopped=stopped)
                 self.current["status"] = "stopped" if stopped else "finished"
                 self.current["endedAt"] = time.strftime("%Y-%m-%d %H:%M:%S")
                 self.current["exitCode"] = exit_code
                 self.current["result"] = result
-                self.current["logs"].append(f"Finished with exit code {exit_code}: {result}")
-                self.store.update_project(
-                    self.current["projectId"],
-                    {
-                        "lastResult": result,
-                        "lastExitCode": exit_code,
-                        "lastRunAt": self.current["endedAt"],
-                    },
+                self.current["logs"].append(
+                    f"Finished with exit code {exit_code}: {result}"
                 )
+                try:
+                    self.store.update_project(
+                        self.current["projectId"],
+                        {
+                            "lastResult": result,
+                            "lastExitCode": exit_code,
+                            "lastRunAt": self.current["endedAt"],
+                        },
+                    )
+                except Exception as exc:
+                    self.current["logs"].append(
+                        f"Failed to update project metadata: {exc}"
+                    )
+
+            # Clear shared fields ONLY when they still belong to this
+            # run. A newer run that has installed its own process / Job
+            # must not have them wiped out from underneath it.
+            if self._process is process:
+                self._process = None
+            if self._job is job:
+                self._job = None
+
             self._condition.notify_all()
+
+        # Always close THIS run's captured Job so descendants are reaped
+        # even when ``current`` was replaced. ``_Win32JobObject.close``
+        # is idempotent for real Job Objects (handle becomes ``None``
+        # after the first close), so a double-close after ``stop()`` /
+        # ``shutdown()`` is safe.
+        if job:
+            try:
+                job.close()
+            except Exception:
+                pass
+        # Clean up the gate file (if any) for the same run.
+        if gate:
+            try:
+                gate.cleanup()
+            except Exception:
+                pass
 
 
 def initialize_project(project: dict[str, Any], store: ProjectStore) -> dict[str, Any]:
@@ -2736,7 +3419,14 @@ class GuiHandler(BaseHTTPRequestHandler):
                 run = self.runs.start(project, body.get("options") or {})
                 self.send_json({"run": run}, HTTPStatus.CREATED)
             elif path == "/api/runs/current/stop":
-                self.send_json({"run": self.runs.stop()})
+                # P2-1: route through ``shutdown_and_snapshot`` so the
+                # Job Object is closed even when the direct wrapper has
+                # already exited but descendants (Claude / Codex CLI)
+                # are still running inside the Job. The previous call to
+                # ``stop()`` raised 409 CONFLICT in that case, leaving
+                # the run visible as "running" while descendants kept
+                # modifying the project until the desktop app exited.
+                self.send_json({"run": self.runs.shutdown_and_snapshot()})
             else:
                 self.send_error_json(HTTPStatus.NOT_FOUND, "Endpoint not found.")
         except ApiError as exc:
@@ -2870,6 +3560,109 @@ def create_server(host: str, port: int) -> ThreadingHTTPServer:
     return ThreadingHTTPServer((host, port), GuiHandler)
 
 
+def configure_paths(state_dir: Path | str | None = None) -> Path:
+    """Override the application state directory and rebind store singletons.
+
+    Used by the desktop app to redirect task/project/settings writes to
+    ``%LOCALAPPDATA%\\CodexClaudeDevLoop\\.gui`` without breaking
+    source-mode invocations that continue to use the in-repo ``.gui``.
+
+    Updates the module-level constants (``STATE_DIR`` and friends) **and**
+    the ``GuiHandler`` class-level singletons so the request handler and
+    any caller importing ``PROJECTS_FILE`` / ``TASKS_DIR`` / etc. see the
+    same target directory. Returns the resolved state directory.
+    """
+    global STATE_DIR, PROJECTS_FILE, TASKS_DIR, TRASH_TASKS_DIR
+    global SETTINGS_FILE, AUDIT_LOG_FILE, MERGE_RECOVERY_DIR
+    if state_dir is None or str(state_dir) == "":
+        state_dir = (
+            Path(os.environ["CCDL_STATE_DIR"]).expanduser()
+            if os.environ.get("CCDL_STATE_DIR")
+            else ROOT / ".gui"
+        )
+    STATE_DIR = Path(state_dir).expanduser().resolve()
+    PROJECTS_FILE = STATE_DIR / "projects.json"
+    TASKS_DIR = STATE_DIR / "tasks"
+    TRASH_TASKS_DIR = STATE_DIR / "trash" / "tasks"
+    SETTINGS_FILE = STATE_DIR / "settings.json"
+    AUDIT_LOG_FILE = STATE_DIR / "audit.log"
+    MERGE_RECOVERY_DIR = STATE_DIR / "merge_recovery"
+    GuiHandler.store = ProjectStore(PROJECTS_FILE)
+    GuiHandler.runs = RunManager(GuiHandler.store)
+    GuiHandler.tasks = TaskStore(TASKS_DIR, TRASH_TASKS_DIR)
+    return STATE_DIR
+
+
+def find_available_port(host: str = "127.0.0.1", preferred: int = 8765, attempts: int = 64) -> int:
+    """Return a TCP port on ``host`` that is currently free.
+
+    Tries ``preferred`` first, then increments. If none of the candidates
+    are bindable the OS is asked to pick an ephemeral port (``port=0``)
+    so the desktop app always has a workable address.
+    """
+    import socket as _socket
+
+    for offset in range(attempts):
+        candidate = preferred + offset
+        if candidate < 1024 or candidate > 65535:
+            continue
+        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        try:
+            sock.bind((host, candidate))
+        except OSError:
+            continue
+        else:
+            sock.close()
+            return candidate
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+    sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    try:
+        sock.bind((host, 0))
+        return sock.getsockname()[1]
+    finally:
+        sock.close()
+
+
+def create_server_on_free_port(
+    host: str = "127.0.0.1",
+    preferred_port: int = 8765,
+) -> tuple[ThreadingHTTPServer, int]:
+    """Bind ``ThreadingHTTPServer`` to an actually-free port.
+
+    Unlike :func:`find_available_port` + :func:`create_server` this keeps
+    the listener socket open between probe and serve, eliminating the
+    TOCTOU window where another process could grab the port between the
+    probe close and the server bind.
+    """
+    import socket as _socket
+
+    last_error: Exception | None = None
+    for offset in range(64):
+        candidate = preferred_port + offset
+        if candidate < 1024 or candidate > 65535:
+            continue
+        try:
+            return ThreadingHTTPServer((host, candidate), GuiHandler), candidate
+        except OSError as exc:
+            last_error = exc
+            continue
+    # Last resort: let the OS pick.
+    listener = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    try:
+        listener.bind((host, 0))
+        port = listener.getsockname()[1]
+    finally:
+        listener.close()
+    try:
+        return ThreadingHTTPServer((host, port), GuiHandler), port
+    except OSError as exc:
+        raise RuntimeError(f"Unable to bind GUI HTTP server: {exc}") from exc
+
+
 def _recover_pending_merges_at_startup(
     task_store: TaskStore | None = None,
 ) -> None:
@@ -2904,10 +3697,22 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Local web GUI for the Codex/Claude orchestrator.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument(
+        "--state-dir",
+        default=None,
+        help=(
+            "Override the application state directory (.gui). "
+            "Use this to redirect task/project/settings/logs to a writable "
+            "user data folder when running outside the source tree "
+            "(for example the packaged desktop app)."
+        ),
+    )
     args = parser.parse_args()
 
+    if args.state_dir:
+        configure_paths(args.state_dir)
     os.chdir(ROOT)
-    STATE_DIR.mkdir(exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
     # Codex P1-1 round 19: recover any pending merge journals before
     # the server starts serving requests so a crash between forward CAS
     # and materialisation in a previous session is handled before a
@@ -2915,6 +3720,8 @@ def main() -> None:
     _recover_pending_merges_at_startup()
     server = create_server(args.host, args.port)
     print(f"GUI running at http://{args.host}:{args.port}")
+    if STATE_DIR != (ROOT / ".gui"):
+        print(f"State directory: {STATE_DIR}")
     print("Press Ctrl+C to stop.")
     try:
         server.serve_forever()
