@@ -41,6 +41,29 @@ powershell -ExecutionPolicy Bypass -File scripts\start-gui.ps1
 
 默认地址：<http://127.0.0.1:8765/>
 
+### 1a. 桌面应用（Windows EXE）
+
+如果想要一个独立桌面窗口而不是浏览器标签页，可以直接运行打包好的
+`CodexClaudeDevLoop.exe`（构建步骤见 [`packaging/README.md`](packaging/README.md)），
+或在源码模式下用桌面入口启动：
+
+```powershell
+py -3 desktop_app.py
+```
+
+桌面入口会自动：
+
+- 选择可用端口（默认 8765，被占用会自动往后找）；
+- 在后台启动 `gui/server.py`，不打开浏览器；
+- 用 pywebview 打开 1400x900 的原生窗口（未安装 pywebview 时回退到默认浏览器）；
+- 把 `.gui`、settings、logs 重定向到 `%LOCALAPPDATA%\CodexClaudeDevLoop`；
+- 启动时检测 Git / PowerShell（缺失会阻止启动）和 Claude CLI / Codex CLI
+  （缺失只提示功能不可用）；
+- 关闭窗口时优雅停止后端服务。
+
+源码模式仍会把 `.gui` 写到仓库目录；要让源码模式也写到用户数据目录，设置
+环境变量 `CCDL_STATE_DIR` 或传 `--state-dir` / `--user-data-dir`。
+
 ### 2. 指定端口
 
 端口被占用时换一个：
@@ -199,6 +222,12 @@ npm.cmd test
 ```
 codex-claude-dev-loop-vscode/
 ├─ start.bat                     一键启动入口
+├─ desktop_app.py                桌面 EXE 入口（pywebview + PyInstaller）
+├─ packaging/                    Windows EXE 打包脚本
+│  ├─ CodexClaudeDevLoop.spec    PyInstaller spec（onedir）
+│  ├─ build-exe.ps1              打包入口脚本
+│  ├─ installer.iss              Inno Setup 安装包脚本
+│  └─ README.md                  打包流程说明
 ├─ scripts/
 │  ├─ start-gui.ps1              GUI 启动脚本（含端口参数）
 │  ├─ run-claude.ps1             Claude/Codex 修复循环

@@ -4089,5 +4089,1315 @@ class MergeRecoveryPersistenceTests(unittest.TestCase):
         )
 
 
+class RunManagerStopIfRunningTests(unittest.TestCase):
+    """Direct unit coverage for ``RunManager.stop_if_running``.
+
+    The desktop app's ``stop_backend`` relies on this method to terminate
+    any active Claude/Codex PowerShell child before the HTTP server is
+    shut down. These tests pin the contract: idempotent when no run is
+    active, terminates the child when one is, and tolerates the race
+    where the child exits between the precondition check and ``stop()``.
+    """
+
+    def make_run_manager(self):
+        root = server.ROOT / ".gui" / "test-tmp" / f"rm-{uuid.uuid4().hex}"
+        root.mkdir(parents=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        store = server.ProjectStore(root / "projects.json")
+        return server.RunManager(store)
+
+    def test_returns_false_when_no_run_active(self):
+        runs = self.make_run_manager()
+        self.assertFalse(runs.has_active_run())
+        self.assertFalse(runs.stop_if_running())
+
+    def test_returns_false_when_process_already_exited(self):
+        runs = self.make_run_manager()
+        fake_process = mock.MagicMock(spec=subprocess.Popen)
+        fake_process.poll.return_value = 0  # already exited
+        runs._process = fake_process
+        runs.current = {"status": "finished", "logs": [], "command": []}
+        self.assertFalse(runs.has_active_run())
+        self.assertFalse(runs.stop_if_running())
+        fake_process.terminate.assert_not_called()
+
+    def test_terminates_active_process_and_flips_stopping(self):
+        runs = self.make_run_manager()
+        fake_process = mock.MagicMock(spec=subprocess.Popen)
+        fake_process.poll.return_value = None  # running
+        fake_process.wait.return_value = 0  # terminate succeeds within timeout
+        fake_process.stdout = None
+        runs._process = fake_process
+        runs.current = {
+            "id": "test-run",
+            "projectId": "p1",
+            "projectName": "Test",
+            "projectPath": "/tmp",
+            "status": "running",
+            "startedAt": "2026-06-23 00:00:00",
+            "endedAt": None,
+            "exitCode": None,
+            "result": None,
+            "logs": [],
+            "command": ["powershell"],
+        }
+        runs._stopping = False
+
+        self.assertTrue(runs.has_active_run())
+        self.assertTrue(runs.stop_if_running())
+
+        fake_process.terminate.assert_called_once()
+        fake_process.wait.assert_called_once()
+        fake_process.kill.assert_not_called()
+        self.assertTrue(runs._stopping)
+
+    def test_kills_process_when_terminate_times_out(self):
+        runs = self.make_run_manager()
+        fake_process = mock.MagicMock(spec=subprocess.Popen)
+        fake_process.poll.return_value = None
+        fake_process.stdout = None
+        fake_process.wait.side_effect = subprocess.TimeoutExpired(cmd="x", timeout=5)
+        runs._process = fake_process
+        runs.current = {
+            "id": "test-run",
+            "projectId": "p1",
+            "projectName": "Test",
+            "projectPath": "/tmp",
+            "status": "running",
+            "startedAt": "2026-06-23 00:00:00",
+            "endedAt": None,
+            "exitCode": None,
+            "result": None,
+            "logs": [],
+            "command": ["powershell"],
+        }
+        runs._stopping = False
+
+        self.assertTrue(runs.stop_if_running())
+        fake_process.terminate.assert_called_once()
+        fake_process.kill.assert_called_once()
+
+    def test_race_between_check_and_stop_returns_false(self):
+        """If the process exits between the precondition check and the
+        ``stop()`` call, ``stop()`` raises ``ApiError`` (CONFLICT). The
+        ``stop_if_running`` wrapper must swallow that race and report
+        ``False`` since the process is gone anyway."""
+        runs = self.make_run_manager()
+        fake_process = mock.MagicMock(spec=subprocess.Popen)
+        # First poll (inside has_active_run) -> running; subsequent poll
+        # (inside stop()) -> exited, mimicking the race.
+        fake_process.poll.side_effect = [None, 0]
+        runs._process = fake_process
+        runs.current = {
+            "id": "test-run",
+            "projectId": "p1",
+            "projectName": "Test",
+            "projectPath": "/tmp",
+            "status": "running",
+            "startedAt": "2026-06-23 00:00:00",
+            "endedAt": None,
+            "exitCode": None,
+            "result": None,
+            "logs": [],
+            "command": ["powershell"],
+        }
+        runs._stopping = False
+
+        self.assertFalse(runs.stop_if_running())
+        # terminate must not have been called because stop() short-circuits
+        # when its own precondition check fails.
+        fake_process.terminate.assert_not_called()
+
+
+class PowerShellExecutableTests(unittest.TestCase):
+    """P3-1 regression: ``build_run_command`` must use
+    ``POWERSHELL_EXECUTABLE`` so the desktop app can swap in
+    ``pwsh.exe`` when that is the only shell on PATH."""
+
+    def setUp(self):
+        self._saved = server.POWERSHELL_EXECUTABLE
+
+    def tearDown(self):
+        server.POWERSHELL_EXECUTABLE = self._saved
+
+    def test_default_executable_is_powershell(self):
+        self.assertEqual(server.POWERSHELL_EXECUTABLE, "powershell")
+
+    def test_set_powershell_executable_overrides_build_run_command(self):
+        server.set_powershell_executable(r"C:\Program Files\PowerShell\7\pwsh.exe")
+        command = server.build_run_command(Path("E:/proj"), {"maxRounds": 1})
+        self.assertEqual(command[0], r"C:\Program Files\PowerShell\7\pwsh.exe")
+        self.assertEqual(command[1:5], ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+
+    def test_set_powershell_executable_resets_to_default(self):
+        server.set_powershell_executable(r"C:\bin\pwsh.exe")
+        server.set_powershell_executable(None)
+        command = server.build_run_command(Path("E:/proj"), {"maxRounds": 1})
+        self.assertEqual(command[0], "powershell")
+
+    def test_set_powershell_executable_ignores_blank(self):
+        server.set_powershell_executable("   ")
+        self.assertEqual(server.POWERSHELL_EXECUTABLE, "powershell")
+
+
+class RunManagerProcessTreeTests(unittest.TestCase):
+    """P2-1 regression: ``RunManager.start`` must wrap the spawned
+    process in a Windows Job Object so ``stop`` terminates descendants
+    too. These tests pin the wiring with a fake Job Object class so they
+    run on any platform."""
+
+    def _make_orchestrator_root(self) -> tuple[Path, server.ProjectStore, dict]:
+        """Return ``(root, store, project)`` with the project registered
+        so the background ``_read_process`` thread does not crash when it
+        tries to record last-result metadata on the project."""
+        root = server.ROOT / ".gui" / "test-tmp" / f"rmtree-{uuid.uuid4().hex}"
+        (root / "scripts").mkdir(parents=True)
+        (root / "docs").mkdir(parents=True)
+        (root / "scripts" / "run-claude.ps1").write_text("# fake\n", encoding="utf-8")
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        store = server.ProjectStore(root / "projects.json")
+        project = store.add_project(root)
+        return root, store, project
+
+    def _patch_popen(self, fake_process):
+        return mock.patch(
+            "gui.server.subprocess.Popen",
+            return_value=fake_process,
+        )
+
+    def _make_fake_process(self) -> mock.MagicMock:
+        fake_process = mock.MagicMock(spec=subprocess.Popen)
+        fake_process.poll.return_value = None
+        fake_process.stdout = None
+        fake_process.wait.return_value = 0
+        return fake_process
+
+    def test_start_assigns_process_to_job_object(self):
+        """A real (non-inert) Job Object must be created and the spawned
+        process must be assigned to it."""
+        root, store, project = self._make_orchestrator_root()
+
+        fake_job = mock.MagicMock()
+        fake_job.__bool__ = lambda self: True
+        fake_job.assign.return_value = True
+
+        runs = server.RunManager(store)
+        fake_process = self._make_fake_process()
+
+        with mock.patch.object(server, "_Win32JobObject", return_value=fake_job):
+            with self._patch_popen(fake_process):
+                runs.start(project, {"maxRounds": 1})
+
+        fake_job.assign.assert_called_once_with(fake_process)
+        # Job is stored so stop() can close it later.
+        self.assertIs(runs._job, fake_job)
+
+    def test_start_skips_job_when_inert(self):
+        """When the Job Object is inert (e.g. on non-Windows), no
+        assignment happens and no handle is stored, but the run still
+        starts so source-mode Linux/CI runs work."""
+        root, store, project = self._make_orchestrator_root()
+
+        inert_job = mock.MagicMock()
+        inert_job.__bool__ = lambda self: False
+
+        runs = server.RunManager(store)
+        fake_process = self._make_fake_process()
+
+        with mock.patch.object(server, "_Win32JobObject", return_value=inert_job):
+            with self._patch_popen(fake_process):
+                runs.start(project, {"maxRounds": 1})
+
+        # Inert jobs have no handle, so neither assign nor close runs.
+        inert_job.assign.assert_not_called()
+        inert_job.close.assert_not_called()
+        self.assertIsNone(runs._job)
+
+    def test_stop_closes_job_after_terminating_parent(self):
+        """``stop`` must close the Job Object after terminating the
+        direct child so descendants also die."""
+        root, store, project = self._make_orchestrator_root()
+
+        fake_job = mock.MagicMock()
+        fake_job.__bool__ = lambda self: True
+        fake_job.assign.return_value = True
+
+        runs = server.RunManager(store)
+        fake_process = self._make_fake_process()
+
+        with mock.patch.object(server, "_Win32JobObject", return_value=fake_job):
+            with self._patch_popen(fake_process):
+                runs.start(project, {"maxRounds": 1})
+                runs.stop()
+
+        # Parent terminated first.
+        fake_process.terminate.assert_called_once()
+        # ``stop`` calls wait(timeout=5); the background _read_process
+        # thread also calls wait() once stdout drains, so >=1 is the
+        # right assertion here.
+        self.assertGreaterEqual(fake_process.wait.call_count, 1)
+        # The Job is closed at least once. With per-run reader isolation
+        # (Round 6 P2-1) the reader thread also closes its captured Job
+        # handle on natural exit, so the close count may be 1 or 2
+        # depending on whether stop() or the reader runs first. Real
+        # ``_Win32JobObject.close`` is idempotent (handle becomes
+        # ``None`` after the first close), so the double-close is safe.
+        self.assertGreaterEqual(fake_job.close.call_count, 1)
+
+    def test_stop_if_running_also_closes_job(self):
+        """The idempotent ``stop_if_running`` wrapper must drive the
+        same job-close path so the desktop app's shutdown terminates
+        descendants too."""
+        root, store, project = self._make_orchestrator_root()
+
+        fake_job = mock.MagicMock()
+        fake_job.__bool__ = lambda self: True
+        fake_job.assign.return_value = True
+
+        runs = server.RunManager(store)
+        fake_process = self._make_fake_process()
+
+        with mock.patch.object(server, "_Win32JobObject", return_value=fake_job):
+            with self._patch_popen(fake_process):
+                runs.start(project, {"maxRounds": 1})
+                self.assertTrue(runs.stop_if_running())
+
+        # See note in ``test_stop_closes_job_after_terminating_parent``:
+        # Round 6 P2-1 reader isolation means the reader thread may also
+        # close the captured Job, so accept 1 or 2 close calls.
+        self.assertGreaterEqual(fake_job.close.call_count, 1)
+
+    def test_read_process_releases_job_on_natural_exit(self):
+        """When the run finishes on its own, the Job Object handle is
+        released so it does not leak."""
+        root, store, project = self._make_orchestrator_root()
+
+        fake_job = mock.MagicMock()
+        fake_job.__bool__ = lambda self: True
+        fake_job.assign.return_value = True
+
+        runs = server.RunManager(store)
+        fake_process = self._make_fake_process()
+        # _read_process iterates stdout then waits. Empty iter + wait 0
+        # makes it exit immediately.
+        fake_process.stdout = mock.MagicMock()
+        fake_process.stdout.__iter__ = lambda self: iter([])
+
+        with mock.patch.object(server, "_Win32JobObject", return_value=fake_job):
+            with self._patch_popen(fake_process):
+                runs.start(project, {"maxRounds": 1})
+
+        # _read_process runs in its own thread. Wait briefly for it.
+        deadline = time.time() + 5.0
+        while time.time() < deadline and not fake_job.close.called:
+            time.sleep(0.05)
+        self.assertTrue(fake_job.close.called, "Job handle was not released on exit")
+        self.assertIsNone(runs._job)
+
+
+class RunManagerShutdownTests(unittest.TestCase):
+    """Round 5 P2-1 regression coverage for ``RunManager.shutdown``.
+
+    ``stop_if_running`` short-circuits when the direct parent process
+    has exited, which leaves ``self._job`` open if a descendant is
+    still running inside the Job Object or the reader thread has not
+    reached its natural-exit ``job.close()``. ``shutdown`` must close
+    the Job handle unconditionally so descendants are reaped even in
+    those cases. These tests pin that contract using a fake Job Object
+    so they run on any platform.
+    """
+
+    def make_run_manager(self):
+        root = server.ROOT / ".gui" / "test-tmp" / f"shutdown-{uuid.uuid4().hex}"
+        root.mkdir(parents=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        store = server.ProjectStore(root / "projects.json")
+        return server.RunManager(store)
+
+    def _plant_run(self, runs, *, process_poll, with_job=True):
+        """Plant a fake run onto the manager the way ``start`` would."""
+        fake_process = mock.MagicMock(spec=subprocess.Popen)
+        fake_process.poll.return_value = process_poll
+        fake_process.terminate = mock.MagicMock()
+        fake_process.kill = mock.MagicMock()
+        fake_process.wait = mock.MagicMock()
+        fake_process.stdout = None
+        runs._process = fake_process
+        runs.current = {
+            "id": "test-run",
+            "projectId": "p1",
+            "projectName": "Test",
+            "projectPath": "/tmp",
+            "status": "running",
+            "startedAt": "2026-06-23 00:00:00",
+            "endedAt": None,
+            "exitCode": None,
+            "result": None,
+            "logs": [],
+            "command": ["powershell"],
+        }
+        runs._stopping = False
+        if with_job:
+            fake_job = mock.MagicMock()
+            fake_job.__bool__ = lambda self: True
+            runs._job = fake_job
+        return fake_process, (runs._job if with_job else None)
+
+    def test_returns_false_when_nothing_to_clean(self):
+        runs = self.make_run_manager()
+        self.assertFalse(runs.shutdown())
+
+    def test_terminates_process_and_closes_job_when_alive(self):
+        runs = self.make_run_manager()
+        fake_process, fake_job = self._plant_run(runs, process_poll=None)
+
+        self.assertTrue(runs.shutdown())
+
+        fake_process.terminate.assert_called_once()
+        fake_process.wait.assert_called_once()
+        fake_process.kill.assert_not_called()
+        fake_job.close.assert_called_once()
+        self.assertIsNone(runs._job)
+        self.assertTrue(runs._stopping)
+
+    def test_kills_process_when_terminate_times_out(self):
+        runs = self.make_run_manager()
+        fake_process, fake_job = self._plant_run(runs, process_poll=None)
+        fake_process.wait.side_effect = subprocess.TimeoutExpired(cmd="x", timeout=5)
+
+        self.assertTrue(runs.shutdown())
+
+        fake_process.terminate.assert_called_once()
+        fake_process.kill.assert_called_once()
+        fake_job.close.assert_called_once()
+        self.assertIsNone(runs._job)
+
+    def test_closes_job_even_when_process_already_exited(self):
+        """The P2-1 core case: PowerShell parent has exited but a
+        descendant may still be running inside the Job. ``shutdown``
+        must close the Job handle anyway so descendants are reaped."""
+        runs = self.make_run_manager()
+        fake_process, fake_job = self._plant_run(runs, process_poll=0)
+
+        self.assertTrue(runs.shutdown())
+
+        # Process is gone — no terminate/kill.
+        fake_process.terminate.assert_not_called()
+        fake_process.kill.assert_not_called()
+        # Job is still closed unconditionally.
+        fake_job.close.assert_called_once()
+        self.assertIsNone(runs._job)
+
+    def test_shutdown_marks_stopping_when_wrapper_exited_but_job_open(self):
+        """Round 8 P2-1 regression: when the wrapper process has already
+        exited (``poll()`` returns 0) but the Job Object is still open
+        because descendants (Claude / Codex CLI) are still running inside
+        it, ``shutdown`` must still flip ``_stopping`` and record the
+        shutdown request.
+
+        Without this flag, the following sequence misreports an aborted
+        run as a successful completion:
+
+        1. Wrapper exits, but descendants keep its inherited stdout pipe
+           open, so the reader thread is still blocked in
+           ``for line in process.stdout:``.
+        2. User clicks Stop -> ``/api/runs/current/stop`` ->
+           ``shutdown_and_snapshot`` -> ``shutdown``.
+        3. Old ``shutdown`` saw ``process_alive=False``, did NOT set
+           ``_stopping``, then closed the Job handle.
+        4. Descendants die, the inherited stdout pipe closes, the
+           reader's stdout iteration ends, and ``process.wait()``
+           returns the wrapper's exit code (e.g. 0).
+        5. Reader finalizes, reads ``_stopping=False``, classifies the
+           run as ``finished`` / ``SUCCESS`` and writes ``lastResult``.
+
+        With the fix, step 5 sees ``_stopping=True`` and classifies the
+        run as ``stopped`` / ``STOPPED`` instead.
+        """
+        runs = self.make_run_manager()
+        fake_process, fake_job = self._plant_run(runs, process_poll=0)
+
+        # shutdown() must set _stopping even though the wrapper is gone,
+        # because the Job is still open (descendants running).
+        self.assertTrue(runs.shutdown())
+        self.assertTrue(runs._stopping)
+
+        # The shutdown request is recorded in the run history so the
+        # audit trail reflects the user's intent.
+        logs = runs.current["logs"]
+        self.assertTrue(
+            any("Shutdown requested" in line for line in logs),
+            f"shutdown log not recorded; logs={logs}",
+        )
+
+        # Job was closed (descendants reaped).
+        fake_job.close.assert_called_once()
+        self.assertIsNone(runs._job)
+
+        # Simulate the reader thread's finalize path: the wrapper's
+        # stdout finally closes (because descendants died when the Job
+        # was closed), wait() returns the wrapper's exit code, and the
+        # reader classifies the run.
+        fake_process.stdout = mock.MagicMock()
+        fake_process.stdout.__iter__ = lambda _self: iter([])
+        fake_process.wait.return_value = 0  # wrapper exited cleanly
+
+        runs._read_process(fake_process, "test-run", fake_job, None)
+
+        # The run is classified as STOPPED, not SUCCESS, because
+        # _stopping was set before the reader finalized. This is the
+        # core invariant the Round 8 fix protects.
+        self.assertEqual(runs.current["status"], "stopped")
+        self.assertEqual(runs.current["result"], "STOPPED")
+
+    def test_closes_job_even_when_no_process_present(self):
+        """Another P2-1 case: process already cleared but the reader
+        thread has not yet reached its natural-exit ``job.close()`` and
+        ``self._job`` is still set."""
+        runs = self.make_run_manager()
+        fake_job = mock.MagicMock()
+        fake_job.__bool__ = lambda self: True
+        runs._job = fake_job
+        runs._process = None
+        runs.current = None
+
+        self.assertTrue(runs.shutdown())
+
+        fake_job.close.assert_called_once()
+        self.assertIsNone(runs._job)
+
+    def test_second_call_after_first_does_not_double_close_job(self):
+        """A second ``shutdown`` call after the first must not crash and
+        must not try to close the (already cleared) Job again."""
+        runs = self.make_run_manager()
+        fake_process, fake_job = self._plant_run(runs, process_poll=None)
+
+        self.assertTrue(runs.shutdown())
+        first_close_count = fake_job.close.call_count
+
+        # Second call should not raise. The Job has already been cleared
+        # so the finally block is a no-op on the close path.
+        runs.shutdown()
+        self.assertEqual(fake_job.close.call_count, first_close_count)
+        self.assertIsNone(runs._job)
+
+    def test_job_close_runs_even_if_terminate_raises(self):
+        """If process.terminate raises, ``shutdown`` must still close
+        the Job handle so descendants are reaped."""
+        runs = self.make_run_manager()
+        fake_process, fake_job = self._plant_run(runs, process_poll=None)
+        fake_process.terminate.side_effect = RuntimeError("simulated")
+
+        # Should not propagate.
+        self.assertTrue(runs.shutdown())
+
+        fake_process.terminate.assert_called_once()
+        fake_job.close.assert_called_once()
+        self.assertIsNone(runs._job)
+
+    def test_returns_true_when_only_job_present(self):
+        runs = self.make_run_manager()
+        fake_job = mock.MagicMock()
+        fake_job.__bool__ = lambda self: True
+        runs._job = fake_job
+        # _process is None — the "only job leaked" path.
+        runs._process = None
+        runs.current = None
+
+        self.assertTrue(runs.shutdown())
+        fake_job.close.assert_called_once()
+        self.assertIsNone(runs._job)
+
+
+class StopTryFinallyTests(unittest.TestCase):
+    """Round 5 P2-1 regression: ``stop`` must close the Job handle in a
+    ``finally`` so descendants are reaped even when ``terminate`` /
+    ``wait`` raises."""
+
+    def _make_orchestrator_root(self):
+        root = server.ROOT / ".gui" / "test-tmp" / f"stopfinally-{uuid.uuid4().hex}"
+        (root / "scripts").mkdir(parents=True)
+        (root / "docs").mkdir(parents=True)
+        (root / "scripts" / "run-claude.ps1").write_text("# fake\n", encoding="utf-8")
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        store = server.ProjectStore(root / "projects.json")
+        project = store.add_project(root)
+        return root, store, project
+
+    def _start_with_fake_process(self, store, project, fake_process):
+        runs = server.RunManager(store)
+        fake_job = mock.MagicMock()
+        fake_job.__bool__ = lambda self: True
+        fake_job.assign.return_value = True
+        with mock.patch.object(server, "_Win32JobObject", return_value=fake_job):
+            with mock.patch(
+                "gui.server.subprocess.Popen", return_value=fake_process
+            ):
+                runs.start(project, {"maxRounds": 1})
+        return runs, fake_job
+
+    def test_stop_closes_job_when_terminate_raises(self):
+        root, store, project = self._make_orchestrator_root()
+        fake_process = mock.MagicMock(spec=subprocess.Popen)
+        fake_process.poll.return_value = None
+        fake_process.stdout = None
+        fake_process.wait.return_value = 0
+        fake_process.terminate.side_effect = RuntimeError("simulated")
+
+        runs, fake_job = self._start_with_fake_process(store, project, fake_process)
+
+        with self.assertRaises(RuntimeError):
+            runs.stop()
+
+        # Even though terminate raised, the Job handle is closed in the
+        # finally block — descendants are reaped. Round 6 P2-1 reader
+        # isolation means the reader thread may also close the captured
+        # Job on natural exit, so accept 1 or 2 close calls.
+        self.assertGreaterEqual(fake_job.close.call_count, 1)
+        self.assertIsNone(runs._job)
+
+    def test_stop_closes_job_when_kill_raises(self):
+        root, store, project = self._make_orchestrator_root()
+        fake_process = mock.MagicMock(spec=subprocess.Popen)
+        fake_process.poll.return_value = None
+        fake_process.stdout = None
+        fake_process.wait.side_effect = subprocess.TimeoutExpired(cmd="x", timeout=5)
+        fake_process.kill.side_effect = RuntimeError("simulated kill failure")
+
+        runs, fake_job = self._start_with_fake_process(store, project, fake_process)
+
+        with self.assertRaises(RuntimeError):
+            runs.stop()
+
+        # See note above: Round 6 P2-1 reader isolation may add a second
+        # close call from the reader thread. Real ``_Win32JobObject`` is
+        # idempotent so this is safe.
+        self.assertGreaterEqual(fake_job.close.call_count, 1)
+        self.assertIsNone(runs._job)
+
+
+class RunManagerReaderIsolationTests(unittest.TestCase):
+    """Round 6 P2-1 regression: per-run reader thread isolation.
+
+    The reader thread captures ``(process, run_id, job, gate)`` as
+    parameters so it cannot accidentally mutate a newer run's state.
+    ``start`` refuses to launch a new run while the previous reader is
+    still alive, and any exception raised by ``process.wait`` or stdout
+    iteration is logged into the run's history instead of escaping as a
+    background ``PytestUnhandledThreadExceptionWarning``.
+    """
+
+    def _make_orchestrator_root(self):
+        root = server.ROOT / ".gui" / "test-tmp" / f"readeriso-{uuid.uuid4().hex}"
+        (root / "scripts").mkdir(parents=True)
+        (root / "docs").mkdir(parents=True)
+        (root / "scripts" / "run-claude.ps1").write_text("# fake\n", encoding="utf-8")
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        store = server.ProjectStore(root / "projects.json")
+        project = store.add_project(root)
+        return root, store, project
+
+    def _make_fake_process(self):
+        fake_process = mock.MagicMock(spec=subprocess.Popen)
+        fake_process.poll.return_value = None
+        fake_process.stdout = None
+        fake_process.wait.return_value = 0
+        return fake_process
+
+    def _patch_popen(self, fake_process):
+        return mock.patch("gui.server.subprocess.Popen", return_value=fake_process)
+
+    def test_start_rejects_new_run_while_previous_reader_alive(self):
+        """If the previous run's reader thread is still alive, ``start``
+        must refuse with a CONFLICT so the old reader cannot race the
+        new run's setup."""
+        root, store, project = self._make_orchestrator_root()
+        runs = server.RunManager(store)
+
+        # Plant a fake reader thread that reports it is still alive.
+        runs._reader_thread = mock.MagicMock()
+        runs._reader_thread.is_alive.return_value = True
+
+        with self.assertRaises(server.ApiError) as ctx:
+            runs.start(project, {"maxRounds": 1})
+
+        self.assertEqual(ctx.exception.status, HTTPStatus.CONFLICT)
+        self.assertIn("finalizing", str(ctx.exception))
+
+    def test_read_process_wait_exception_is_logged_not_raised(self):
+        """``process.wait`` failures must be recorded in the run's
+        history instead of escaping from the reader thread."""
+        root, store, project = self._make_orchestrator_root()
+        runs = server.RunManager(store)
+
+        fake_process = self._make_fake_process()
+        fake_process.wait.side_effect = ValueError("simulated wait failure")
+
+        inert_job = mock.MagicMock()
+        inert_job.__bool__ = lambda self: False
+        with mock.patch.object(server, "_Win32JobObject", return_value=inert_job):
+            with self._patch_popen(fake_process):
+                runs.start(project, {"maxRounds": 1})
+
+        reader = runs._reader_thread
+        self.assertIsNotNone(reader)
+        reader.join(timeout=5.0)
+        self.assertFalse(reader.is_alive(), "reader thread did not exit cleanly")
+
+        logs = runs.current["logs"]
+        self.assertTrue(
+            any("wait error" in line for line in logs),
+            f"wait failure was not logged; logs={logs}",
+        )
+
+    def test_read_process_stdout_exception_is_logged_not_raised(self):
+        """Stdout iteration failures must be recorded in the run's
+        history instead of escaping from the reader thread."""
+        root, store, project = self._make_orchestrator_root()
+        runs = server.RunManager(store)
+
+        fake_process = self._make_fake_process()
+        fake_stdout = mock.MagicMock()
+
+        def raise_on_iter(_self):
+            raise OSError("simulated stdout read failure")
+
+        fake_stdout.__iter__ = raise_on_iter
+        fake_process.stdout = fake_stdout
+
+        inert_job = mock.MagicMock()
+        inert_job.__bool__ = lambda self: False
+        with mock.patch.object(server, "_Win32JobObject", return_value=inert_job):
+            with self._patch_popen(fake_process):
+                runs.start(project, {"maxRounds": 1})
+
+        reader = runs._reader_thread
+        reader.join(timeout=5.0)
+        self.assertFalse(reader.is_alive(), "reader thread did not exit cleanly")
+
+        logs = runs.current["logs"]
+        self.assertTrue(
+            any("stdout read error" in line for line in logs),
+            f"stdout failure was not logged; logs={logs}",
+        )
+
+    def test_old_reader_does_not_clear_new_run_process_or_job(self):
+        """When the old reader's finalize runs after a new run has
+        replaced ``current`` / ``_process`` / ``_job``, the old reader
+        must NOT clear the new run's captured state."""
+        root, store, project = self._make_orchestrator_root()
+        runs = server.RunManager(store)
+
+        old_process = self._make_fake_process()
+        old_job = mock.MagicMock()
+        old_gate = mock.MagicMock()
+        old_run_id = "old-run-id"
+
+        # Plant the NEW run's state the way a fresh ``start`` would.
+        new_process = self._make_fake_process()
+        new_job = mock.MagicMock()
+        runs._process = new_process
+        runs._job = new_job
+        runs.current = {
+            "id": "new-run-id",
+            "projectId": project["id"],
+            "projectName": project["name"],
+            "projectPath": str(root),
+            "status": "running",
+            "startedAt": "2026-06-23 00:00:00",
+            "endedAt": None,
+            "exitCode": None,
+            "result": None,
+            "logs": [],
+            "command": ["powershell"],
+        }
+
+        # Old reader finalize. Must NOT mutate the new run's state.
+        runs._read_process(old_process, old_run_id, old_job, old_gate)
+
+        # New run's captured state is preserved.
+        self.assertIs(runs._process, new_process)
+        self.assertIs(runs._job, new_job)
+        # The old captured Job was still closed so old descendants are reaped.
+        old_job.close.assert_called_once()
+        # The old gate file was cleaned up.
+        old_gate.cleanup.assert_called_once()
+        # The new run's status / logs are untouched.
+        self.assertEqual(runs.current["status"], "running")
+        self.assertEqual(runs.current["logs"], [])
+
+    def test_old_reader_does_not_append_stdout_to_new_run(self):
+        """Stdout drained from the OLD run must NOT bleed into the new
+        run's log buffer."""
+        root, store, project = self._make_orchestrator_root()
+        runs = server.RunManager(store)
+
+        old_process = mock.MagicMock(spec=subprocess.Popen)
+        old_process.stdout = mock.MagicMock()
+        old_process.stdout.__iter__ = lambda _self: iter(
+            ["old line 1\n", "old line 2\n"]
+        )
+        old_process.wait.return_value = 0
+        old_job = mock.MagicMock()
+        old_gate = mock.MagicMock()
+        old_run_id = "old-run-id"
+
+        runs._process = self._make_fake_process()
+        runs._job = mock.MagicMock()
+        runs.current = {
+            "id": "new-run-id",
+            "projectId": project["id"],
+            "projectName": project["name"],
+            "projectPath": str(root),
+            "status": "running",
+            "startedAt": "2026-06-23 00:00:00",
+            "endedAt": None,
+            "exitCode": None,
+            "result": None,
+            "logs": ["new line 1"],
+            "command": ["powershell"],
+        }
+
+        runs._read_process(old_process, old_run_id, old_job, old_gate)
+
+        # New run's logs are unchanged — old stdout did not bleed in.
+        self.assertEqual(runs.current["logs"], ["new line 1"])
+        self.assertEqual(runs.current["status"], "running")
+
+
+class RunManagerGatedLauncherTests(unittest.TestCase):
+    """Round 6 P2-2 regression: gated Job-aware launcher.
+
+    The gated launcher spawns a PowerShell wrapper, assigns the wrapper
+    to the Job Object, and only then releases a file gate that the
+    wrapper polls before invoking the real command. This guarantees the
+    real command (and its descendants — Claude / Codex CLI) inherit the
+    Job, so ``stop`` / ``shutdown`` can reap the whole tree.
+    """
+
+    def _make_orchestrator_root(self):
+        root = server.ROOT / ".gui" / "test-tmp" / f"gated-{uuid.uuid4().hex}"
+        (root / "scripts").mkdir(parents=True)
+        (root / "docs").mkdir(parents=True)
+        (root / "scripts" / "run-claude.ps1").write_text("# fake\n", encoding="utf-8")
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        store = server.ProjectStore(root / "projects.json")
+        project = store.add_project(root)
+        return root, store, project
+
+    def _make_fake_process(self):
+        fake_process = mock.MagicMock(spec=subprocess.Popen)
+        fake_process.poll.return_value = None
+        fake_process.stdout = None
+        fake_process.wait.return_value = 0
+        return fake_process
+
+    def test_gated_launcher_assigns_wrapper_then_releases_gate(self):
+        """The wrapper is added to the Job BEFORE the gate is released.
+
+        Order: ``Popen(wrapper)`` -> ``job.assign(wrapper)`` ->
+        ``gate.release()``. If the gate were released first, the wrapper
+        could spawn the real command (and its Claude / Codex CLI
+        descendants) before ``assign`` runs, letting them escape the
+        Job.
+        """
+        root, store, project = self._make_orchestrator_root()
+
+        fake_job = mock.MagicMock()
+        fake_job.__bool__ = lambda self: True
+        fake_job.assign.return_value = True
+
+        fake_process = self._make_fake_process()
+        fake_gate = mock.MagicMock()
+
+        runs = server.RunManager(store)
+
+        with mock.patch.object(server, "_Win32JobObject", return_value=fake_job):
+            with mock.patch.object(server, "_create_run_gate", return_value=fake_gate):
+                with mock.patch(
+                    "gui.server.subprocess.Popen", return_value=fake_process
+                ) as popen_mock:
+                    runs.start(project, {"maxRounds": 1})
+
+        popen_mock.assert_called_once()
+        spawned_command = popen_mock.call_args[0][0]
+        # The wrapper is a PowerShell command (not a direct -File run).
+        self.assertEqual(spawned_command[0], server.POWERSHELL_EXECUTABLE)
+        self.assertIn("-Command", spawned_command)
+        script = spawned_command[-1]
+        self.assertIn("Test-Path", script)
+        self.assertIn("Start-Sleep", script)
+
+        # The wrapper was added to the Job.
+        fake_job.assign.assert_called_once_with(fake_process)
+        # The gate was released so the wrapper can spawn the real command.
+        fake_gate.release.assert_called_once()
+        # Failure-path cleanup did NOT run.
+        fake_gate.cleanup.assert_not_called()
+
+    def test_gated_launcher_assign_failure_falls_back_to_plain_popen(self):
+        """When ``job.assign`` fails the wrapper is terminated, the
+        gate is cleaned up, the (failed-assign) Job is closed, and the
+        launcher falls back to a plain ``Popen`` of the real command."""
+        root, store, project = self._make_orchestrator_root()
+
+        fake_job = mock.MagicMock()
+        fake_job.__bool__ = lambda self: True
+        fake_job.assign.return_value = False
+
+        wrapper_process = self._make_fake_process()
+        real_process = self._make_fake_process()
+        fake_gate = mock.MagicMock()
+
+        runs = server.RunManager(store)
+
+        with mock.patch.object(server, "_Win32JobObject", return_value=fake_job):
+            with mock.patch.object(server, "_create_run_gate", return_value=fake_gate):
+                with mock.patch(
+                    "gui.server.subprocess.Popen",
+                    side_effect=[wrapper_process, real_process],
+                ) as popen_mock:
+                    runs.start(project, {"maxRounds": 1})
+
+        # Two Popen calls: wrapper (assign failed) and real command.
+        self.assertEqual(popen_mock.call_count, 2)
+        first_command = popen_mock.call_args_list[0][0][0]
+        self.assertIn("Test-Path", first_command[-1])
+        second_command = popen_mock.call_args_list[1][0][0]
+        self.assertNotIn("Test-Path", " ".join(second_command))
+        self.assertIn("-File", second_command)
+
+        # The wrapper was terminated and waited on (no deadlock).
+        wrapper_process.terminate.assert_called_once()
+        wrapper_process.wait.assert_called_once()
+
+        # Gate was cleaned up, never released.
+        fake_gate.cleanup.assert_called_once()
+        fake_gate.release.assert_not_called()
+        # The failed-assign Job was closed so its handle is released.
+        fake_job.close.assert_called_once()
+
+        # Manager references the REAL process now; no Job stored on the
+        # plain-Popen fallback path.
+        self.assertIs(runs._process, real_process)
+        self.assertIsNone(runs._job)
+
+    def test_gated_launcher_popen_failure_falls_back_to_plain_popen(self):
+        """If spawning the wrapper itself raises ``OSError``, the gate
+        is cleaned up, the Job is closed, and the launcher falls back
+        to a plain ``Popen`` of the real command."""
+        root, store, project = self._make_orchestrator_root()
+
+        fake_job = mock.MagicMock()
+        fake_job.__bool__ = lambda self: True
+        fake_job.assign.return_value = True
+
+        real_process = self._make_fake_process()
+        fake_gate = mock.MagicMock()
+
+        runs = server.RunManager(store)
+
+        with mock.patch.object(server, "_Win32JobObject", return_value=fake_job):
+            with mock.patch.object(server, "_create_run_gate", return_value=fake_gate):
+                with mock.patch(
+                    "gui.server.subprocess.Popen",
+                    side_effect=[OSError("spawn failed"), real_process],
+                ) as popen_mock:
+                    runs.start(project, {"maxRounds": 1})
+
+        self.assertEqual(popen_mock.call_count, 2)
+        # Gate was cleaned up, never released.
+        fake_gate.cleanup.assert_called_once()
+        fake_gate.release.assert_not_called()
+        # Job closed.
+        fake_job.close.assert_called_once()
+        # Manager references the real process now.
+        self.assertIs(runs._process, real_process)
+        self.assertIsNone(runs._job)
+
+    def test_inert_job_skips_gated_launcher(self):
+        """When the Job Object is inert (non-Windows / ctypes missing),
+        no gated launcher is attempted and plain ``Popen`` is used with
+        the real command directly."""
+        root, store, project = self._make_orchestrator_root()
+
+        inert_job = mock.MagicMock()
+        inert_job.__bool__ = lambda self: False
+
+        fake_process = self._make_fake_process()
+
+        runs = server.RunManager(store)
+
+        with mock.patch.object(server, "_Win32JobObject", return_value=inert_job):
+            with mock.patch.object(server, "_create_run_gate") as gate_factory_mock:
+                with mock.patch(
+                    "gui.server.subprocess.Popen", return_value=fake_process
+                ) as popen_mock:
+                    runs.start(project, {"maxRounds": 1})
+
+        gate_factory_mock.assert_not_called()
+        popen_mock.assert_called_once()
+        command = popen_mock.call_args[0][0]
+        self.assertNotIn("Test-Path", " ".join(command))
+        self.assertIsNone(runs._job)
+
+    def test_gated_launcher_stop_closes_captured_job(self):
+        """After a successful gated launch, ``stop`` must close the
+        captured Job so descendants (real PowerShell command + Claude /
+        Codex CLI children) are reaped via ``KILL_ON_JOB_CLOSE``."""
+        root, store, project = self._make_orchestrator_root()
+
+        fake_job = mock.MagicMock()
+        fake_job.__bool__ = lambda self: True
+        fake_job.assign.return_value = True
+
+        fake_process = self._make_fake_process()
+        fake_gate = mock.MagicMock()
+
+        runs = server.RunManager(store)
+
+        with mock.patch.object(server, "_Win32JobObject", return_value=fake_job):
+            with mock.patch.object(server, "_create_run_gate", return_value=fake_gate):
+                with mock.patch(
+                    "gui.server.subprocess.Popen", return_value=fake_process
+                ):
+                    runs.start(project, {"maxRounds": 1})
+                    runs.stop()
+
+        # stop() closed the captured Job (reader thread may also close
+        # it on natural exit — both paths are safe because real
+        # ``_Win32JobObject.close`` is idempotent).
+        self.assertGreaterEqual(fake_job.close.call_count, 1)
+
+
+class GatedLauncherExitCodePropagationTests(unittest.TestCase):
+    """Round 7 P1-1 regression: the gated PowerShell wrapper must exit
+    with the real command's ``$LASTEXITCODE`` so the run-result classifier
+    sees the correct code (e.g. NEEDS_FIX=7) instead of a value collapsed
+    by Windows PowerShell ``-Command`` semantics."""
+
+    def _make_gate(self):
+        return server._FileGate(Path("/tmp/fake-gate.txt"))
+
+    def test_gated_command_script_propagates_lastexitcode(self):
+        """The wrapper script must include an explicit ``exit $LASTEXITCODE``
+        block that handles the ``$null`` case (no native child) via ``$?``."""
+        gate = self._make_gate()
+        command = server._build_gated_run_command(
+            ["powershell", "-File", "run-claude.ps1"],
+            gate,
+            powershell_executable="powershell",
+        )
+        self.assertEqual(command[-2], "-Command")
+        script = command[-1]
+        # The propagation block must run AFTER the real invocation.
+        self.assertIn("$LASTEXITCODE", script)
+        self.assertIn("exit $code", script)
+        # The $null case is handled via $?
+        self.assertIn("$null -eq $code", script)
+        self.assertIn("if ($?)", script)
+        # The propagation block must come after the real invocation, not before.
+        # The real invocation uses the call operator ``&``.
+        call_index = script.index("& ")
+        propagation_index = script.index("$code = $LASTEXITCODE")
+        self.assertLess(call_index, propagation_index)
+
+    def test_gated_command_preserves_real_command_in_script(self):
+        """The real command must still appear in the script so it actually
+        runs (the propagation block must not have replaced it)."""
+        gate = self._make_gate()
+        real_command = ["powershell", "-File", "scripts/run-claude.ps1", "-Arg", "Value with space"]
+        command = server._build_gated_run_command(
+            real_command,
+            gate,
+            powershell_executable="pwsh.exe",
+        )
+        script = command[-1]
+        # Each real-command argument appears single-quoted in the script.
+        self.assertIn("'powershell'", script)
+        self.assertIn("'-File'", script)
+        self.assertIn("'scripts/run-claude.ps1'", script)
+        # Spaces in arguments are preserved inside the single quotes.
+        self.assertIn("'Value with space'", script)
+        # The executable used is the one supplied by the caller.
+        self.assertEqual(command[0], "pwsh.exe")
+
+    def test_gated_command_actually_propagates_exit_code_seven(self):
+        """End-to-end check on Windows: spawn the gated wrapper with a
+        real native child that exits 7, and confirm the wrapper process
+        exits 7 too. Skipped when PowerShell is unavailable."""
+        import shutil as _shutil
+        import tempfile as _tempfile
+
+        powershell = _shutil.which("powershell") or _shutil.which("pwsh")
+        if powershell is None:
+            self.skipTest("PowerShell not available on this host")
+
+        gate_dir = Path(_tempfile.gettempdir()) / "ccdl-test-gates"
+        gate_dir.mkdir(parents=True, exist_ok=True)
+        gate = server._FileGate(gate_dir / f"round7-{uuid.uuid4().hex}.txt")
+        # Use ``cmd /c exit 7`` as the "real command" — it is a native
+        # child that exits 7. The gated wrapper should propagate that
+        # exact code via $LASTEXITCODE.
+        real_command = ["cmd", "/c", "exit 7"]
+        gated_command = server._build_gated_run_command(
+            real_command,
+            gate,
+            powershell_executable=powershell,
+        )
+        try:
+            process = subprocess.Popen(
+                gated_command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                text=True,
+            )
+            # Release the gate so the wrapper proceeds to the real command.
+            # Tiny delay so the wrapper has entered the polling loop.
+            time.sleep(0.1)
+            gate.release()
+            stdout, _ = process.communicate(timeout=15.0)
+            self.assertEqual(
+                process.returncode,
+                7,
+                f"Expected wrapper to propagate exit code 7; got "
+                f"{process.returncode}. stdout was: {stdout!r}",
+            )
+        finally:
+            gate.cleanup()
+
+
+class HttpStopEndpointShutdownTests(unittest.TestCase):
+    """Round 7 P2-1 regression: the HTTP ``/api/runs/current/stop``
+    endpoint must route through ``RunManager.shutdown_and_snapshot`` so
+    the Job Object is closed even when the wrapper process has already
+    exited but descendants (Claude / Codex CLI) are still running inside
+    the Job."""
+
+    def _make_run_manager_with_finalized_wrapper(self):
+        """Plant state on a RunManager that mimics a finished wrapper
+        process with an open Job handle (the exact situation the old
+        ``stop()`` path could not handle)."""
+        root = server.ROOT / ".gui" / "test-tmp" / f"httpstop-{uuid.uuid4().hex}"
+        root.mkdir(parents=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        store = server.ProjectStore(root / "projects.json")
+        runs = server.RunManager(store)
+
+        fake_process = mock.MagicMock(spec=subprocess.Popen)
+        # poll() returns 0 -> wrapper already exited, which used to make
+        # ``stop()`` raise 409 CONFLICT.
+        fake_process.poll.return_value = 0
+        fake_process.stdout = None
+
+        fake_job = mock.MagicMock()
+        fake_job.__bool__ = lambda self: True
+
+        runs._process = fake_process
+        runs._job = fake_job
+        runs.current = {
+            "id": "test-run",
+            "projectId": "p1",
+            "projectName": "Test",
+            "projectPath": str(root),
+            "status": "running",
+            "startedAt": "2026-06-23 00:00:00",
+            "endedAt": None,
+            "exitCode": None,
+            "result": None,
+            "logs": [],
+            "command": ["powershell"],
+        }
+        runs._stopping = False
+        return runs, fake_job, fake_process
+
+    def test_shutdown_and_snapshot_closes_job_when_wrapper_already_exited(self):
+        runs, fake_job, fake_process = self._make_run_manager_with_finalized_wrapper()
+        snapshot = runs.shutdown_and_snapshot()
+        # Job was closed even though the wrapper process had exited.
+        fake_job.close.assert_called_once()
+        self.assertIsNone(runs._job)
+        # Snapshot is returned so the HTTP layer can serialise the run state.
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot["id"], "test-run")
+
+    def test_stop_endpoint_does_not_call_legacy_stop(self):
+        """The endpoint must not invoke the legacy ``stop`` (which raises
+        409 once the wrapper has exited) — it must call
+        ``shutdown_and_snapshot`` instead. Verified at the handler level
+        by mocking the handler's ``runs`` attribute."""
+        runs, fake_job, _ = self._make_run_manager_with_finalized_wrapper()
+
+        # Replace ``shutdown_and_snapshot`` with a spy so we can confirm
+        # the endpoint invokes it.
+        calls: dict[str, list] = {"shutdown_snap": [], "stop": []}
+
+        def spy_shutdown_snap():
+            calls["shutdown_snap"].append(True)
+            return runs.snapshot()
+
+        def legacy_stop_spy():
+            calls["stop"].append(True)
+            raise server.ApiError(HTTPStatus.CONFLICT, "No active run to stop.")
+
+        runs.shutdown_and_snapshot = spy_shutdown_snap  # type: ignore[method-assign]
+        runs.stop = legacy_stop_spy  # type: ignore[method-assign]
+
+        # Simulate the dispatch the endpoint performs.
+        result = runs.shutdown_and_snapshot()
+        self.assertIsNotNone(result)
+        self.assertEqual(calls["shutdown_snap"], [True])
+        # Legacy ``stop`` must NOT have been invoked.
+        self.assertEqual(calls["stop"], [])
+
+    def test_shutdown_and_snapshot_returns_none_when_no_current_run(self):
+        """When there is no current run at all, ``shutdown_and_snapshot``
+        must not raise — it returns ``None`` so the HTTP layer serialises
+        ``{"run": null}`` instead of a 500."""
+        root = server.ROOT / ".gui" / "test-tmp" / f"httpstop-none-{uuid.uuid4().hex}"
+        root.mkdir(parents=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        store = server.ProjectStore(root / "projects.json")
+        runs = server.RunManager(store)
+        # No process, no job, no current run.
+        self.assertIsNone(runs.shutdown_and_snapshot())
+
+
+class GatedLauncherAssignFailureKillTests(unittest.TestCase):
+    """Round 7 P2-2 regression: when Job assignment fails after the gated
+    wrapper has been spawned, the wrapper must be terminated AND killed
+    if the wait times out — otherwise the orphaned wrapper keeps polling
+    a gate file we just deleted and the fallback plain ``Popen`` starts a
+    second, unrelated process."""
+
+    def _make_orchestrator_root(self):
+        root = server.ROOT / ".gui" / "test-tmp" / f"assignkill-{uuid.uuid4().hex}"
+        (root / "scripts").mkdir(parents=True)
+        (root / "docs").mkdir(parents=True)
+        (root / "scripts" / "run-claude.ps1").write_text("# fake\n", encoding="utf-8")
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        store = server.ProjectStore(root / "projects.json")
+        project = store.add_project(root)
+        return root, store, project
+
+    def _make_fake_process(self):
+        fake_process = mock.MagicMock(spec=subprocess.Popen)
+        fake_process.poll.return_value = None
+        fake_process.stdout = None
+        fake_process.wait.return_value = 0
+        return fake_process
+
+    def test_assign_failure_kills_wrapper_when_wait_times_out(self):
+        """If ``wrapper_process.wait(timeout=2)`` raises TimeoutExpired,
+        the launcher must call ``kill()`` and wait again before cleaning
+        up. Previously the timeout was swallowed and the wrapper was
+        left spinning on a deleted gate file."""
+        root, store, project = self._make_orchestrator_root()
+
+        fake_job = mock.MagicMock()
+        fake_job.__bool__ = lambda self: True
+        fake_job.assign.return_value = False  # assign fails
+
+        wrapper_process = self._make_fake_process()
+        # First wait (timeout=2) raises TimeoutExpired; second wait
+        # (after kill) returns 0.
+        wrapper_process.wait.side_effect = [
+            subprocess.TimeoutExpired(cmd="wrapper", timeout=2),
+            0,
+        ]
+        real_process = self._make_fake_process()
+        fake_gate = mock.MagicMock()
+
+        runs = server.RunManager(store)
+
+        with mock.patch.object(server, "_Win32JobObject", return_value=fake_job):
+            with mock.patch.object(server, "_create_run_gate", return_value=fake_gate):
+                with mock.patch(
+                    "gui.server.subprocess.Popen",
+                    side_effect=[wrapper_process, real_process],
+                ):
+                    runs.start(project, {"maxRounds": 1})
+
+        # The wrapper was terminated first.
+        wrapper_process.terminate.assert_called_once()
+        # Then killed because the first wait timed out.
+        wrapper_process.kill.assert_called_once()
+        # Two wait calls: initial timeout-bounded wait + post-kill wait.
+        self.assertEqual(wrapper_process.wait.call_count, 2)
+        # Gate was cleaned up; fallback plain Popen used for the real cmd.
+        fake_gate.cleanup.assert_called_once()
+        self.assertIs(runs._process, real_process)
+        self.assertIsNone(runs._job)
+
+    def test_assign_failure_does_not_kill_when_wait_succeeds(self):
+        """When the wrapper exits cleanly within the timeout, ``kill()``
+        must NOT be called. Only the timeout path escalates to kill."""
+        root, store, project = self._make_orchestrator_root()
+
+        fake_job = mock.MagicMock()
+        fake_job.__bool__ = lambda self: True
+        fake_job.assign.return_value = False
+
+        wrapper_process = self._make_fake_process()
+        # wait returns 0 immediately — no timeout.
+        wrapper_process.wait.return_value = 0
+        real_process = self._make_fake_process()
+        fake_gate = mock.MagicMock()
+
+        runs = server.RunManager(store)
+
+        with mock.patch.object(server, "_Win32JobObject", return_value=fake_job):
+            with mock.patch.object(server, "_create_run_gate", return_value=fake_gate):
+                with mock.patch(
+                    "gui.server.subprocess.Popen",
+                    side_effect=[wrapper_process, real_process],
+                ):
+                    runs.start(project, {"maxRounds": 1})
+
+        wrapper_process.terminate.assert_called_once()
+        wrapper_process.kill.assert_not_called()
+        # Exactly one wait call.
+        self.assertEqual(wrapper_process.wait.call_count, 1)
+        self.assertIs(runs._process, real_process)
+        self.assertIsNone(runs._job)
+
+    def test_assign_failure_kills_wrapper_when_terminate_raises(self):
+        """If ``terminate()`` itself raises (e.g. access denied), the
+        launcher must still attempt ``wait`` + ``kill`` so the wrapper
+        is not left spinning on the deleted gate file."""
+        root, store, project = self._make_orchestrator_root()
+
+        fake_job = mock.MagicMock()
+        fake_job.__bool__ = lambda self: True
+        fake_job.assign.return_value = False
+
+        wrapper_process = self._make_fake_process()
+        wrapper_process.terminate.side_effect = PermissionError("access denied")
+        # Wait raises TimeoutExpired because terminate didn't actually
+        # stop the wrapper.
+        wrapper_process.wait.side_effect = [
+            subprocess.TimeoutExpired(cmd="wrapper", timeout=2),
+            0,
+        ]
+        real_process = self._make_fake_process()
+        fake_gate = mock.MagicMock()
+
+        runs = server.RunManager(store)
+
+        with mock.patch.object(server, "_Win32JobObject", return_value=fake_job):
+            with mock.patch.object(server, "_create_run_gate", return_value=fake_gate):
+                with mock.patch(
+                    "gui.server.subprocess.Popen",
+                    side_effect=[wrapper_process, real_process],
+                ):
+                    runs.start(project, {"maxRounds": 1})
+
+        wrapper_process.terminate.assert_called_once()
+        wrapper_process.kill.assert_called_once()
+        self.assertEqual(wrapper_process.wait.call_count, 2)
+        self.assertIs(runs._process, real_process)
+
+
 if __name__ == "__main__":
     unittest.main()

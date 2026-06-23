@@ -26,3 +26,9 @@ claude.bat
 # User local configuration (keep settings.json committed for project-level safety)
 .claude/*
 !.claude/settings.json
+
+# Desktop packaging artifacts (PyInstaller + Inno Setup)
+build/
+dist/
+packaging/Output/
+*.spec.bak
