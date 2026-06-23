@@ -32,10 +32,24 @@ from gui.orchestrator.git_tools import (
     assert_clean_work_tree,
     assert_git_work_tree,
     collect_git_artifacts,
+    compute_repo_id,
+    compute_review_snapshot,
     get_current_branch,
     get_git_common_dir,
     get_main_worktree_path,
+    is_ancestor,
     is_git_worktree,
+    list_worktrees,
+)
+from gui.orchestrator.git_workflow import (
+    CommitError,
+    MergeError,
+    MergeRecoveryJournal,
+    WorktreeCreationError,
+    controlled_commit,
+    controlled_merge_to_main,
+    create_worktree,
+    recover_pending_merge,
 )
 from gui.orchestrator.prompts import (
     write_claude_implementation_prompt,
@@ -61,6 +75,11 @@ TASKS_DIR = STATE_DIR / "tasks"
 TRASH_TASKS_DIR = STATE_DIR / "trash" / "tasks"
 SETTINGS_FILE = STATE_DIR / "settings.json"
 AUDIT_LOG_FILE = STATE_DIR / "audit.log"
+# Codex P1-1 round 19: durable merge-recovery journal directory.
+# Lives under application state storage so the journal survives process
+# restarts and is never written inside ``.git`` or as an untracked file
+# in the target worktree.
+MERGE_RECOVERY_DIR = STATE_DIR / "merge_recovery"
 
 ARTIFACTS = {
     "implementationReport": "docs/IMPLEMENTATION_REPORT.md",
@@ -77,6 +96,99 @@ class ApiError(Exception):
         super().__init__(message)
         self.status = status
         self.message = message
+
+
+# Per-task mutex registry guarding the controlled commit / merge services
+# (Codex P1-4 round 15).  ``ThreadingHTTPServer`` dispatches each HTTP
+# request on its own thread, so a duplicate POST to
+# ``/api/tasks/{id}/commit`` (or ``/merge``) can race a previous in-flight
+# request.  Without serialisation, both requests can read the task in its
+# pre-COMMITTED state, both proceed to execute the Git operation, and the
+# loser of the race then saves its own stale ``Task`` object — overwriting
+# the winner's ``COMMITTED`` metadata and making the task appear
+# uncommitted even though HEAD has actually advanced.
+# The lock covers the *entire* "load → validate → mutate Git → save"
+# span so concurrent requests are serialised per task.  The registry
+# itself is guarded by ``_TASK_LOCKS_GUARD`` so two requests for the
+# same task that arrive simultaneously still get the *same* lock object.
+_TASK_LOCKS: dict[str, threading.RLock] = {}
+_TASK_LOCKS_GUARD = threading.Lock()
+
+
+def _task_operation_lock(task_id: str) -> threading.RLock:
+    """Return the per-task ``RLock`` used to serialise controlled commit / merge."""
+    if not task_id:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "Task id is required.")
+    with _TASK_LOCKS_GUARD:
+        lock = _TASK_LOCKS.get(task_id)
+        if lock is None:
+            lock = threading.RLock()
+            _TASK_LOCKS[task_id] = lock
+    return lock
+
+
+# Per-resource mutex registry keyed by canonical worktree / repository
+# path (Codex P1-3 round 16).  The per-task lock above serialises
+# requests for the *same* task ID, but different tasks bound to the same
+# worktree / repository can still race the underlying Git index and refs
+# because each task's per-task lock is independent.  Without a
+# resource-level lock, two tasks on the same worktree can interleave
+# ``git add -A`` / ``commit-tree`` / ``update-ref`` invocations — the
+# CAS ref update catches the loser, but only after both Git operations
+# have run and the loser's ``COMMIT_BLOCKED`` audit record has been
+# written.  Holding the resource lock around the actual Git mutation
+# serialises those mutations per worktree / repo, while unrelated
+# repositories remain free to proceed concurrently.
+_RESOURCE_LOCKS: dict[str, threading.RLock] = {}
+_RESOURCE_LOCKS_GUARD = threading.Lock()
+_AUDIT_LOG_LOCK = threading.RLock()
+
+
+def _resource_lock_key(resource_path: Path) -> str:
+    """Canonical cache key for ``resource_path``.
+
+    Uses ``resolve(strict=False)`` so the key is stable even when the
+    path does not currently exist (e.g. a worktree that was just
+    removed).  Lower-cases the resulting string so Windows's
+    case-insensitive filesystem does not produce two distinct locks for
+    what is effectively the same directory.
+    """
+    try:
+        resolved = resource_path.expanduser().resolve(strict=False)
+    except (OSError, ValueError):
+        resolved = resource_path
+    return str(resolved).lower()
+
+
+def _resource_operation_lock(resource_path: Path) -> threading.RLock:
+    """Return the per-resource ``RLock`` used to serialise Git mutations on
+    ``resource_path`` (Codex P1-3 round 16).
+
+    The per-task lock serialises the ``load → validate → save`` span for
+    a single task; this resource lock additionally serialises the
+    actual Git mutations (``git add``, ``commit-tree``, ``update-ref``,
+    ``merge``) so two different tasks bound to the same worktree /
+    primary repository cannot concurrently perturb the same index or
+    refs.  Unrelated repositories still proceed concurrently because
+    their resource locks are independent.
+    """
+    if resource_path is None:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "Resource path is required.")
+    key = _resource_lock_key(resource_path)
+    with _RESOURCE_LOCKS_GUARD:
+        lock = _RESOURCE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _RESOURCE_LOCKS[key] = lock
+    return lock
+
+
+def _merge_recovery_dir(task_store: TaskStore) -> Path:
+    """Return the application-state journal directory owned by ``task_store``."""
+    try:
+        return Path(task_store.tasks_root).parent / "merge_recovery"
+    except (AttributeError, TypeError, ValueError):
+        return MERGE_RECOVERY_DIR
 
 
 def now_ms() -> int:
@@ -105,8 +217,43 @@ def write_audit_log(action: str, subject: str, details: dict[str, Any] | None = 
         "subject": subject,
         "details": details or {},
     }
-    with AUDIT_LOG_FILE.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    with _AUDIT_LOG_LOCK:
+        with AUDIT_LOG_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+
+def _merge_audit_exists(operation_id: str, action: str) -> bool:
+    """Return whether a durable merge audit for this operation already exists."""
+    if not operation_id or not AUDIT_LOG_FILE.is_file():
+        return False
+    with _AUDIT_LOG_LOCK:
+        try:
+            lines = AUDIT_LOG_FILE.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return False
+    for line in lines:
+        try:
+            payload = json.loads(line)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if payload.get("action") != action:
+            continue
+        details = payload.get("details")
+        if isinstance(details, dict) and details.get("operationId") == operation_id:
+            return True
+    return False
+
+
+def _write_merge_audit_once(
+    action: str, subject: str, operation_id: str, details: dict[str, Any]
+) -> None:
+    """Idempotently append one durable audit line for a merge operation."""
+    with _AUDIT_LOG_LOCK:
+        if _merge_audit_exists(operation_id, action):
+            return
+        write_audit_log(action, subject, {"operationId": operation_id, **details})
 
 
 def normalize_path(raw_path: str) -> Path:
@@ -150,6 +297,37 @@ def is_inside_git_repo(path: Path) -> bool:
         return False
 
 
+def _path_is_worktree_root(path: Path) -> bool:
+    """Return True when ``path`` is itself a Git working-tree root.
+
+    Distinguishes a real primary or linked worktree from a stray subdirectory
+    that merely lives inside a parent Git repository.  Uses ``git rev-parse
+    --show-toplevel`` so empty ``.git`` placeholders and nested paths do not
+    pass: only paths whose declared toplevel matches themselves qualify.
+    """
+    if not path.exists() or not path.is_dir():
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if result.returncode != 0:
+        return False
+    toplevel = (result.stdout or "").strip()
+    if not toplevel:
+        return False
+    try:
+        return Path(toplevel).resolve(strict=False) == path.resolve(strict=False)
+    except (OSError, ValueError):
+        return False
+
+
 def make_project(path: Path, name: str | None = None) -> dict[str, Any]:
     kind = detect_project_kind(path)
     project: dict[str, Any] = {
@@ -159,6 +337,7 @@ def make_project(path: Path, name: str | None = None) -> dict[str, Any]:
         "kind": kind,
         "worktreeType": None,
         "gitCommonDir": None,
+        "repoId": None,
         "branch": None,
         "mainWorktreePath": None,
         "available": True,
@@ -168,7 +347,9 @@ def make_project(path: Path, name: str | None = None) -> dict[str, Any]:
     }
     if kind in ("orchestrator", "git-uninitialized"):
         try:
-            project["gitCommonDir"] = get_git_common_dir(path)
+            common_dir = get_git_common_dir(path)
+            project["gitCommonDir"] = common_dir
+            project["repoId"] = compute_repo_id(common_dir)
             project["branch"] = get_current_branch(path)
             if is_git_worktree(path):
                 project["worktreeType"] = "worktree"
@@ -279,6 +460,10 @@ class ProjectStore:
             if project.get("gitCommonDir") != common_dir:
                 project["gitCommonDir"] = common_dir
                 changed = True
+            repo_id = compute_repo_id(common_dir)
+            if project.get("repoId") != repo_id:
+                project["repoId"] = repo_id
+                changed = True
             branch = get_current_branch(path)
             if project.get("branch") != branch:
                 project["branch"] = branch
@@ -302,6 +487,7 @@ class ProjectStore:
     def add_project(self, path: Path, name: str | None = None) -> dict[str, Any]:
         project = make_project(path, name)
         projects = self.list_projects()
+        updated_existing = False
         for existing in projects:
             if self._same_path(str(path), str(existing.get("path", ""))):
                 existing.update(
@@ -311,16 +497,74 @@ class ProjectStore:
                         "kind": project["kind"],
                         "worktreeType": project.get("worktreeType"),
                         "gitCommonDir": project.get("gitCommonDir"),
+                        "repoId": project.get("repoId"),
                         "branch": project.get("branch"),
                         "mainWorktreePath": project.get("mainWorktreePath"),
                         "available": True,
                     }
                 )
                 self.save_projects(projects)
-                return existing
-        projects.append(project)
-        self.save_projects(projects)
+                project = existing
+                updated_existing = True
+                break
+        if not updated_existing:
+            projects.append(project)
+            self.save_projects(projects)
+
+        # Auto-discover sibling worktrees so the project tree reflects the
+        # repository layout. Failures are silent: a missing common dir just
+        # means there is nothing else to register.
+        self._auto_discover_sibling_worktrees(path, projects)
         return project
+
+    def _auto_discover_sibling_worktrees(
+        self, imported_path: Path, projects: list[dict[str, Any]]
+    ) -> None:
+        """Register every sibling worktree of the same Git repository.
+
+        Called after a project is added or refreshed so the project list
+        reflects the full repository layout.  Never raises — Git discovery is
+        best-effort and any failure simply leaves the project list unchanged.
+        Only fires when ``imported_path`` is itself a Git worktree root, so a
+        stray subdirectory inside a parent repository does not contaminate the
+        project list with unrelated siblings.
+        """
+        if not _path_is_worktree_root(imported_path):
+            return
+        try:
+            siblings = list_worktrees(imported_path)
+        except Exception:
+            return
+        if not siblings:
+            return
+        changed = False
+        existing_paths = {self._normalize_path(p.get("path", "")) for p in projects}
+        for sibling in siblings:
+            sibling_path_str = sibling.path
+            if not sibling_path_str:
+                continue
+            sibling_path = Path(sibling_path_str)
+            if self._normalize_path(str(sibling_path)) == self._normalize_path(str(imported_path)):
+                continue
+            if not sibling_path.exists() or not sibling_path.is_dir():
+                continue
+            if self._normalize_path(sibling_path_str) in existing_paths:
+                continue
+            if not _path_is_worktree_root(sibling_path):
+                continue
+            try:
+                sibling_project = make_project(sibling_path)
+            except ApiError:
+                continue
+            projects.append(sibling_project)
+            existing_paths.add(self._normalize_path(sibling_project["path"]))
+            changed = True
+        if changed:
+            self.save_projects(projects)
+
+    @staticmethod
+    def _normalize_path(raw: str) -> str:
+        return raw.strip().lower().replace("\\", "/").rstrip("/")
 
     def get_project(self, project_id_value: str) -> dict[str, Any]:
         for project in self.list_projects():
@@ -646,6 +890,9 @@ def create_task(body: dict[str, Any], project_store: ProjectStore, task_store: T
         test_command=str(body.get("testCommand") or ""),
         max_rounds=clamp_max_rounds(body.get("maxRounds", 3)),
     )
+    task.repoId = project.get("repoId")
+    task.worktreeType = project.get("worktreeType")
+    task.worktreeBranch = project.get("branch")
     task_dir = task_store.task_dir(task.id)
     write_claude_implementation_prompt(task, task_dir)
     set_task_status(task, Status.WAITING_FOR_CLAUDE, "Initial Claude prompt generated.")
@@ -653,9 +900,1063 @@ def create_task(body: dict[str, Any], project_store: ProjectStore, task_store: T
     return task
 
 
+def create_project_worktree(
+    project_id_value: str,
+    body: dict[str, Any],
+    project_store: "ProjectStore",
+) -> dict[str, Any]:
+    """Create a development worktree from the project's primary worktree.
+
+    The new worktree is automatically registered as its own project so the
+    project tree updates immediately.  Worktree creation only succeeds when
+    the source is a primary worktree with a clean working tree, a valid
+    branch name, and a non-existing target path.
+
+    Codex P1-2 round 19: the complete operation — HEAD capture, clean
+    check, filter/config checks, branch validation, ``git worktree
+    add``, and registration/recovery response — runs under the primary
+    worktree's per-resource ``RLock``.  Without serialisation, a
+    concurrent controlled merge could advance main between the clean /
+    filter checks and the ``git worktree add`` invocation, causing the
+    new worktree to be checked out from a SHA that was never validated.
+    Holding the same lock the controlled-merge service uses serialises
+    the two operations on the same primary resource, while unrelated
+    repositories remain free to proceed concurrently.
+
+    A single starting SHA is captured inside the lock and passed
+    explicitly to ``create_worktree`` as the final ``git worktree add``
+    start-point argument so the checkout operates on the validated
+    commit rather than the implicit HEAD.
+    """
+    project = project_store.get_project(project_id_value)
+    if project.get("worktreeType") != "primary":
+        raise ApiError(
+            HTTPStatus.BAD_REQUEST,
+            "Worktrees can only be created from a primary worktree.",
+        )
+    if project.get("available") is False:
+        raise ApiError(HTTPStatus.CONFLICT, "Primary worktree path is no longer available.")
+    try:
+        primary_path = Path(project["path"]).expanduser().resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "Primary worktree path does not exist.") from exc
+    branch = str(body.get("branch") or "").strip()
+    target_raw = str(body.get("path") or "").strip()
+    if not target_raw:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "Target path is required.")
+    try:
+        target_path = Path(target_raw).expanduser().resolve(strict=False)
+    except (OSError, ValueError) as exc:
+        raise ApiError(HTTPStatus.BAD_REQUEST, f"Invalid target path: {exc}") from exc
+
+    # Codex P1-2 round 19: hold the primary worktree's resource lock
+    # around the complete operation so a concurrent controlled merge
+    # cannot advance main between checks and creation.  Capture exactly
+    # one starting SHA inside the lock and pass it explicitly to
+    # ``create_worktree`` as the ``git worktree add`` start-point.
+    with _resource_operation_lock(primary_path):
+        head_result = subprocess.run(
+            ["git", "-C", str(primary_path), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if head_result.returncode != 0 or not head_result.stdout.strip():
+            stderr = (head_result.stderr or head_result.stdout or "").strip()
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "Failed to capture primary worktree HEAD before creating "
+                "worktree; refusing to create worktree without a validated "
+                f"start SHA. {stderr}",
+            )
+        captured_start_sha = head_result.stdout.strip()
+        try:
+            result = create_worktree(
+                primary_path, branch, target_path, start_sha=captured_start_sha
+            )
+        except WorktreeCreationError as exc:
+            raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+
+        new_path = Path(result["path"])
+        # Codex P2-1 round 17: previously, ``git worktree add`` succeeded
+        # but a subsequent registration failure raised a generic ``500``
+        # error and left the new worktree on disk in an "orphan" state —
+        # the directory existed, was tracked by Git as a linked worktree,
+        # but did not appear in the project list, so the user had no
+        # backend affordance to remove or re-import it.  Recover by:
+        #
+        # 1. Re-trying registration via the *primary* path's project store
+        #    entry, whose ``_auto_discover_sibling_worktrees`` flow scans
+        #    the repository's worktree list and adds every linked worktree
+        #    that is not already registered.  ``add_project`` already
+        #    invokes this flow as part of its normal post-registration
+        #    bookkeeping; the retry here re-invokes it explicitly against
+        #    the primary worktree path so the new linked worktree is
+        #    picked up even when the new-path ``add_project`` itself is
+        #    what failed.
+        # 2. If the retry still cannot find / register the new worktree,
+        #    return a partial-success payload (HTTP 201 with
+        #    ``worktreeCreated: true`` and ``project: null``) plus
+        #    recovery instructions so the frontend can surface the
+        #    orphan worktree and guide the user to import it manually.
+        #
+        # Codex P1-2 round 19: the registration / recovery response is
+        # produced inside the same resource lock so the entire
+        # operation (HEAD capture → create → register → response) is
+        # atomic with respect to concurrent controlled merges on the
+        # same primary repository.
+        new_project: dict[str, Any] | None = None
+        registration_error: str | None = None
+        try:
+            new_project = project_store.add_project(new_path)
+        except Exception as exc:
+            registration_error = str(exc)
+
+        if new_project is None:
+            # Retry via the primary path's auto-discovery flow: that flow
+            # calls ``list_worktrees`` against the primary worktree and
+            # registers every sibling that is not already tracked, so the
+            # newly-created linked worktree (now present in the Git
+            # worktree list) is picked up even when the explicit
+            # ``add_project(new_path)`` call above failed.
+            try:
+                project_store.add_project(primary_path)
+            except Exception:
+                # Best-effort retry; fall through to the partial-success
+                # return below when both attempts fail.
+                pass
+            # Look up by resolved path: the project may have been added by
+            # the auto-discovery retry above.
+            try:
+                resolved_new = new_path.resolve(strict=False)
+            except (OSError, ValueError):
+                resolved_new = new_path
+            for candidate in project_store.list_projects():
+                try:
+                    candidate_path = Path(str(candidate.get("path", ""))).resolve(strict=False)
+                except (OSError, ValueError):
+                    continue
+                if candidate_path == resolved_new:
+                    new_project = candidate
+                    registration_error = None
+                    break
+
+        if new_project is None:
+            # Both registration attempts failed.  Return a partial-success
+            # payload so the frontend can surface the orphan worktree and
+            # the user can import it manually via the regular
+            # ``POST /api/projects`` endpoint.
+            recovery_instructions = (
+                f"Worktree was created at {result['path']} on branch "
+                f"'{result['branch']}' but could not be registered as a "
+                f"project automatically. Open the project list and add the "
+                f"path manually to import it. Original error: "
+                f"{registration_error or 'unknown'}"
+            )
+            write_audit_log(
+                "project.worktree.create.partial",
+                "orphan",
+                {
+                    "sourceProjectId": project_id_value,
+                    "sourcePath": str(primary_path),
+                    "branch": result["branch"],
+                    "newPath": result["path"],
+                    "error": registration_error or "unknown",
+                },
+            )
+            # Codex P2-2 round 19: include the top-level ``path`` field
+            # so the frontend can surface the created path even when
+            # ``project`` is ``null``.  Previously the partial-success
+            # payload omitted ``path``, forcing the UI to read
+            # ``data.project.path`` which is undefined in this branch;
+            # the UI would then display ``(path unavailable)`` rather
+            # than the real created path.
+            return {
+                "project": None,
+                "path": result["path"],
+                "branch": result["branch"],
+                "worktreeCreated": True,
+                "registeredAutomatically": False,
+                "recoveryInstructions": recovery_instructions,
+            }
+
+        write_audit_log(
+            "project.worktree.create",
+            new_project["id"],
+            {
+                "sourceProjectId": project_id_value,
+                "sourcePath": str(primary_path),
+                "branch": result["branch"],
+                "newPath": result["path"],
+            },
+        )
+        return {"project": new_project, "branch": result["branch"], "worktreeCreated": True, "registeredAutomatically": True}
+
+
+def commit_task_changes(
+    task_id: str,
+    body: dict[str, Any],
+    project_store: ProjectStore,
+    task_store: TaskStore,
+) -> Task:
+    """Commit a PASS task's changes via a controlled backend operation.
+
+    The full ``load → validate → mutate Git → save`` span runs under a
+    per-task ``RLock`` (Codex P1-4 round 15).  ``ThreadingHTTPServer``
+    dispatches each request on its own thread; without serialisation,
+    duplicate concurrent POSTs to ``/api/tasks/{id}/commit`` can both
+    read the task in its pre-COMMITTED state, both proceed to execute
+    the controlled commit, and the loser of the race then saves its
+    own stale ``Task`` object — overwriting the winner's ``COMMITTED``
+    metadata and making the task appear uncommitted even though HEAD
+    has actually advanced.
+    """
+    with _task_operation_lock(task_id):
+        return _commit_task_changes_locked(task_id, body, project_store, task_store)
+
+
+def _commit_task_changes_locked(
+    task_id: str,
+    body: dict[str, Any],
+    project_store: ProjectStore,
+    task_store: TaskStore,
+) -> Task:
+    """Inner body of ``commit_task_changes`` — runs while holding the per-task lock."""
+    # Reload inside the lock so concurrent requests see consistent state.
+    # A previous in-flight request that already mutated ``commitSha`` will
+    # short-circuit on the ``task.commitSha`` check below rather than
+    # attempting a second commit that fails and overwrites the saved
+    # metadata.
+    task = task_store.load(task_id)
+    if task.archivedAt:
+        raise ApiError(HTTPStatus.CONFLICT, "Archived tasks cannot be committed.")
+    if task.deletedAt:
+        raise ApiError(HTTPStatus.CONFLICT, "Trashed tasks cannot be committed.")
+    if task.status in RUNNING_TASK_STATUSES:
+        raise ApiError(HTTPStatus.CONFLICT, "Running tasks cannot be committed.")
+    if task.status != Status.PASS:
+        raise ApiError(HTTPStatus.CONFLICT, "Only PASS tasks can be committed.")
+    if task.commitSha:
+        raise ApiError(HTTPStatus.CONFLICT, "Task has already been committed.")
+    project_path = validate_task_project(task, project_store)
+    message = str(body.get("message") or body.get("name") or "").strip()
+    # The reviewed snapshot is captured at artifact-collection time so it
+    # mirrors exactly what Codex reviewed.  If the snapshot is missing for
+    # the current round (e.g. legacy PASS from before this fix, or capture
+    # failed at artifact time), refuse to commit: there is no reviewed
+    # baseline to compare against, so unreviewed changes could slip in.
+    # ``reviewedHeadSha`` is required (Codex P1-1 round 14): without it,
+    # the CAS ref update and the merge base reachability check would
+    # silently no-op, allowing unreviewed history to slip into the trunk.
+    if (
+        task.reviewedRound is None
+        or task.reviewedRound != task.round
+        or not task.reviewedHeadSha
+        or not task.reviewedStatusHash
+        or not task.reviewedDiffHash
+        or not task.reviewedTreeSha
+    ):
+        task.add_history(
+            "COMMIT_BLOCKED",
+            "No reviewed snapshot for the current round; re-run Claude completion "
+            "and Codex review before committing.",
+        )
+        task_store.save(task)
+        raise ApiError(
+            HTTPStatus.CONFLICT,
+            "Task has no reviewed snapshot for the current round; re-run the "
+            "review cycle before committing.",
+        )
+    expected_snapshot: dict[str, str | None] = {
+        "headSha": task.reviewedHeadSha,
+        "statusHash": task.reviewedStatusHash,
+        "diffHash": task.reviewedDiffHash,
+        "treeSha": task.reviewedTreeSha,
+    }
+    # Codex P1-3 round 16: hold the per-resource lock around the actual
+    # Git mutation so different tasks bound to the same worktree cannot
+    # interleave ``git add -A`` / ``commit-tree`` / ``update-ref``
+    # invocations against the same index and refs.  Reload the task
+    # inside the lock so a concurrent task that committed while we were
+    # waiting is observed (its ``commitSha`` populates and we surface
+    # the conflict instead of running a second Git mutation that fails
+    # the CAS check and overwrites audit state).
+    with _resource_operation_lock(project_path):
+        task = task_store.load(task_id)
+        if task.archivedAt:
+            raise ApiError(HTTPStatus.CONFLICT, "Archived tasks cannot be committed.")
+        if task.deletedAt:
+            raise ApiError(HTTPStatus.CONFLICT, "Trashed tasks cannot be committed.")
+        if task.status in RUNNING_TASK_STATUSES:
+            raise ApiError(HTTPStatus.CONFLICT, "Running tasks cannot be committed.")
+        if task.status != Status.PASS:
+            raise ApiError(HTTPStatus.CONFLICT, "Only PASS tasks can be committed.")
+        if task.commitSha:
+            raise ApiError(HTTPStatus.CONFLICT, "Task has already been committed.")
+        try:
+            result = controlled_commit(project_path, message, expected_snapshot=expected_snapshot)
+        except (CommitError, GitError) as exc:
+            # ``CommitError`` covers the explicit safety rejections (empty
+            # worktree, .env, drift, in-progress operation, etc.).  ``GitError``
+            # covers the underlying read-only helpers
+            # (``compute_review_snapshot``, ``enumerate_env_violations``,
+            # ``get_index_tree_sha``, ``find_clean_filtered_paths``, …) which
+            # Codex P2-1 round 14 noted would otherwise bypass the
+            # ``COMMIT_BLOCKED`` history record and surface as a different
+            # status code via the generic ``do_POST`` handler.  Recording both
+            # under the same history event keeps the audit trail consistent
+            # and the user-facing status code uniform.
+            task.add_history("COMMIT_BLOCKED", str(exc))
+            task_store.save(task)
+            raise ApiError(HTTPStatus.CONFLICT, str(exc)) from exc
+
+    task.commitSha = result["commitSha"]
+    task.commitShortSha = result.get("commitShortSha")
+    task.commitMessage = result["commitMessage"]
+    task.committedAt = utc_now_str()
+    task.lastActivityAt = task.committedAt
+    task.stage = "committed"
+    history_message = (
+        f"Worktree changes committed as {task.commitShortSha or task.commitSha[:10]}: {task.commitMessage}"
+    )
+    history_kwargs: dict[str, Any] = {
+        "commitSha": task.commitSha,
+        "commitShortSha": task.commitShortSha,
+        "commitMessage": task.commitMessage,
+    }
+    # Codex P1-5 round 16: if HEAD drifted between the CAS ref update
+    # and the post-commit observation, surface it in the audit trail
+    # so the recorded ``commitSha`` (the object we authored) can be
+    # reconciled with the live branch tip later.  The drift is not
+    # blocking — the controlled commit succeeded.
+    head_drift = result.get("headDriftSha")
+    if head_drift:
+        history_message += (
+            f" Note: HEAD subsequently moved to {head_drift[:10]}; the recorded "
+            "commitSha remains the controlled commit object."
+        )
+        history_kwargs["headDriftSha"] = head_drift
+    task.add_history("COMMITTED", history_message, **history_kwargs)
+    task_store.save(task)
+    write_audit_log(
+        "task.commit",
+        task.id,
+        {
+            "projectId": task.projectId,
+            "commitSha": task.commitSha,
+            "commitMessage": task.commitMessage,
+        },
+    )
+    return task
+
+
+def merge_task_to_main(
+    task_id: str,
+    project_store: ProjectStore,
+    task_store: TaskStore,
+) -> Task:
+    """Merge a committed task's branch into the main worktree.
+
+    The full ``load → validate → mutate Git → save`` span runs under a
+    per-task ``RLock`` (Codex P1-4 round 15) for the same reason as
+    ``commit_task_changes``: a duplicate concurrent POST would otherwise
+    race a previous in-flight request and the loser could overwrite the
+    winner's ``MERGED`` metadata.
+    """
+    # Recovery runs before taking the requesting task lock.  Each journal
+    # then acquires its own task lock followed by the primary resource lock;
+    # this avoids ever attempting task acquisition while a resource lock is
+    # held and keeps the global order task -> resource.
+    try:
+        task_hint = task_store.load(task_id)
+        project_hint = project_store.get_project(task_hint.projectId)
+        repo_id = project_hint.get("repoId") or task_hint.repoId
+        primary_hint = _find_primary_project_for_repo(
+            project_store, repo_id, project_hint
+        )
+        if primary_hint and primary_hint.get("path"):
+            primary_path_hint = Path(str(primary_hint["path"])).expanduser().resolve(
+                strict=False
+            )
+            _recover_pending_merges_for_primary(
+                primary_path_hint, task_store, task_id
+            )
+    except (ApiError, TaskStoreError, OSError, ValueError):
+        # The locked implementation below performs authoritative validation.
+        pass
+    with _task_operation_lock(task_id):
+        return _merge_task_to_main_locked(task_id, project_store, task_store)
+
+
+def _reviewed_base_block_reason(task) -> str | None:
+    """Return a blocking reason when the reviewed baseline is unavailable.
+
+    Codex P1-3 round 19: the GUI merge path must never invoke
+    ``controlled_merge_to_main`` in compatibility mode (i.e. without a
+    validated ``expected_base_sha``).  When ``reviewedHeadSha`` is empty
+    or ``reviewedRound`` does not match the current round, the
+    lower-level reachability + sole-parent checks silently no-op, so
+    unreviewed pre-task commits could slip into the trunk alongside the
+    reviewed one.  This helper returns a short reason string describing
+    why the merge is blocked (suitable for the ``MERGE_BLOCKED`` audit
+    history) or ``None`` when the reviewed baseline is present and
+    matches the current round.
+    """
+    if task.reviewedRound is None:
+        return (
+            "No reviewed snapshot exists for this task; the merge cannot "
+            "verify the reviewed base is current. Re-run Claude completion "
+            "and Codex review before merging."
+        )
+    if task.reviewedRound != task.round:
+        return (
+            f"Reviewed snapshot is from round {task.reviewedRound} but the "
+            f"current round is {task.round}; the reviewed base may not "
+            f"reflect the committed change. Re-run Claude completion and "
+            f"Codex review before merging."
+        )
+    if not task.reviewedHeadSha:
+        return (
+            "Reviewed HEAD SHA is missing; the merge cannot verify the "
+            "reviewed base reachability. Re-run Claude completion and "
+            "Codex review before merging."
+        )
+    return None
+
+
+def _task_journal_identity_error(task, data: dict[str, Any]) -> str | None:
+    """Return why task metadata cannot be safely reconciled from ``data``."""
+    if task.id != str(data.get("taskId") or ""):
+        return "Journal task id does not match the locked task."
+    if task.round != data.get("taskRound"):
+        return "Journal task round no longer matches the locked task."
+    if (task.commitSha or "").lower() != str(data.get("sourceCommitSha") or "").lower():
+        return "Journal source commit no longer matches the task commit."
+    if (task.reviewedHeadSha or "").lower() != str(data.get("reviewedBaseSha") or "").lower():
+        return "Journal reviewed baseline no longer matches the task."
+    if (task.worktreeBranch or "") != str(data.get("sourceBranch") or ""):
+        return "Journal source branch no longer matches the task worktree branch."
+    if task.mergedAt and (task.mergeCommitSha or "").lower() != str(
+        data.get("newMergeCommitSha") or ""
+    ).lower():
+        return "Task is already marked merged with a different merge commit."
+    return None
+
+
+def _history_has_operation(task, event: str, operation_id: str) -> bool:
+    return any(
+        item.get("event") == event and item.get("operationId") == operation_id
+        for item in task.history
+    )
+
+
+def _persist_completed_merge_journal(
+    task,
+    task_store: "TaskStore",
+    journal: MergeRecoveryJournal,
+    data: dict[str, Any],
+    *,
+    project_id: str,
+    head_drift_sha: str | None = None,
+    recovery_reason: str | None = None,
+) -> None:
+    """Persist task + audit for a materialised merge, then remove its journal."""
+    identity_error = _task_journal_identity_error(task, data)
+    if identity_error:
+        raise MergeError(identity_error + " Manual reconciliation is required.")
+    operation_id = str(data["operationId"])
+    merge_sha = str(data["newMergeCommitSha"])
+    short_sha = merge_sha[:10]
+    short_result = subprocess.run(
+        ["git", "-C", str(data["primaryPath"]), "rev-parse", "--short", merge_sha],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if short_result.returncode == 0 and short_result.stdout.strip():
+        short_sha = short_result.stdout.strip()
+    if not task.mergedAt:
+        task.mergedAt = utc_now_str()
+        task.mergeCommitSha = merge_sha
+        task.mergeShortSha = short_sha
+        task.mergeTargetBranch = str(data["targetBranch"])
+        task.mergeSourceBranch = str(data["sourceBranch"])
+        task.headDriftSha = head_drift_sha
+        task.lastActivityAt = task.mergedAt
+        task.stage = "merged"
+    if not _history_has_operation(task, "MERGED", operation_id):
+        message = (
+            f"Branch '{data['sourceBranch']}' merged into '{data['targetBranch']}' "
+            f"as {task.mergeShortSha or short_sha}"
+        )
+        if head_drift_sha:
+            message += (
+                f" Note: HEAD subsequently moved to {head_drift_sha[:10]}; "
+                "manual reconciliation is required."
+            )
+        task.add_history(
+            "MERGED",
+            message,
+            operationId=operation_id,
+            mergeCommitSha=merge_sha,
+            mergeShortSha=task.mergeShortSha or short_sha,
+            mergeTargetBranch=str(data["targetBranch"]),
+            mergeSourceBranch=str(data["sourceBranch"]),
+            **({"headDriftSha": head_drift_sha} if head_drift_sha else {}),
+        )
+    if recovery_reason and not _history_has_operation(task, "MERGE_RECOVERY", operation_id):
+        task.add_history(
+            "MERGE_RECOVERY", recovery_reason, operationId=operation_id, action="completed"
+        )
+    task_store.save(task)
+    if str(data.get("phase")) != "audit_persisted":
+        journal.advance("task_persisted")
+    audit_details = {
+        "projectId": project_id,
+        "mergeCommitSha": merge_sha,
+        "mergeTargetBranch": str(data["targetBranch"]),
+        "mergeSourceBranch": str(data["sourceBranch"]),
+    }
+    if head_drift_sha:
+        audit_details["headDriftSha"] = head_drift_sha
+    _write_merge_audit_once("task.merge", task.id, operation_id, audit_details)
+    if head_drift_sha:
+        try:
+            still_reachable = is_ancestor(
+                Path(str(data["primaryPath"])), merge_sha, head_drift_sha
+            )
+        except GitError as exc:
+            _write_merge_audit_once(
+                "task.merge.reachability_probe_failed",
+                task.id,
+                operation_id,
+                {
+                    "projectId": project_id,
+                    "mergeCommitSha": merge_sha,
+                    "liveHeadSha": head_drift_sha,
+                    "mergeTargetBranch": str(data["targetBranch"]),
+                    "reason": str(exc),
+                },
+            )
+            still_reachable = None
+        except Exception as exc:
+            _write_merge_audit_once(
+                "task.merge.reachability_probe_failed",
+                task.id,
+                operation_id,
+                {
+                    "projectId": project_id,
+                    "mergeCommitSha": merge_sha,
+                    "liveHeadSha": head_drift_sha,
+                    "mergeTargetBranch": str(data["targetBranch"]),
+                    "reason": f"unexpected probe error: {exc}",
+                },
+            )
+            still_reachable = None
+        if still_reachable is False:
+            _write_merge_audit_once(
+                "task.merge.head_unreachable",
+                task.id,
+                operation_id,
+                {
+                    "projectId": project_id,
+                    "mergeCommitSha": merge_sha,
+                    "liveHeadSha": head_drift_sha,
+                    "mergeTargetBranch": str(data["targetBranch"]),
+                },
+            )
+    if recovery_reason:
+        _write_merge_audit_once(
+            "task.merge.recovery.completed",
+            task.id,
+            operation_id,
+            {"primaryPath": str(data["primaryPath"]), "reason": recovery_reason},
+        )
+    if str(data.get("phase")) != "audit_persisted":
+        journal.advance("audit_persisted")
+    if head_drift_sha:
+        _write_merge_audit_once(
+            "task.merge.recovery.blocked",
+            task.id,
+            operation_id,
+            {
+                "primaryPath": str(data["primaryPath"]),
+                "reason": "HEAD drifted after materialisation; journal retained for manual reconciliation.",
+            },
+        )
+        return
+    journal.delete()
+
+
+def _persist_rolled_back_merge_journal(
+    task,
+    task_store: "TaskStore",
+    journal: MergeRecoveryJournal,
+    data: dict[str, Any],
+    reason: str,
+) -> None:
+    """Persist a rolled-back outcome and only then remove the journal."""
+    identity_error = _task_journal_identity_error(task, data)
+    if identity_error:
+        raise MergeError(identity_error + " Manual reconciliation is required.")
+    operation_id = str(data["operationId"])
+    if not _history_has_operation(task, "MERGE_RECOVERY", operation_id):
+        task.add_history(
+            "MERGE_RECOVERY", reason, operationId=operation_id, action="rolled_back"
+        )
+    task_store.save(task)
+    if str(data.get("phase")) != "rollback_audit_persisted":
+        journal.advance("rollback_task_persisted")
+    _write_merge_audit_once(
+        "task.merge.recovery.rolled_back",
+        task.id,
+        operation_id,
+        {"primaryPath": str(data["primaryPath"]), "reason": reason},
+    )
+    if str(data.get("phase")) != "rollback_audit_persisted":
+        journal.advance("rollback_audit_persisted")
+    journal.delete()
+
+
+def _record_blocked_recovery(
+    task_store: "TaskStore",
+    data: dict[str, Any],
+    operation_id: str,
+    reason: str,
+) -> None:
+    task_id = str(data.get("taskId") or operation_id)
+    try:
+        task = task_store.load(task_id)
+        if not _history_has_operation(task, "MERGE_BLOCKED", operation_id):
+            task.add_history(
+                "MERGE_BLOCKED", reason, operationId=operation_id, action="recovery_blocked"
+            )
+            task_store.save(task)
+    except Exception:
+        pass
+    _write_merge_audit_once(
+        "task.merge.recovery.blocked",
+        task_id,
+        operation_id,
+        {"primaryPath": str(data.get("primaryPath") or ""), "reason": reason},
+    )
+
+
+def _recover_one_merge_journal(
+    journal: MergeRecoveryJournal,
+    task_store: "TaskStore",
+    *,
+    expected_primary: Path | None = None,
+) -> dict[str, Any] | None:
+    """Recover one journal while enforcing task-lock -> resource-lock order."""
+    initial = journal.read()
+    if initial is None:
+        if journal.exists():
+            reason = "Recovery journal is unreadable; manual reconciliation is required."
+            _write_merge_audit_once(
+                "task.merge.recovery.blocked", journal.operation_id, journal.operation_id,
+                {"reason": reason},
+            )
+            return {"action": "blocked", "reason": reason}
+        return None
+    task_id = str(initial.get("taskId") or "")
+    if not task_id.startswith("task_"):
+        reason = "Recovery journal has no valid task identity; manual reconciliation is required."
+        _record_blocked_recovery(task_store, initial, journal.operation_id, reason)
+        return {"action": "blocked", "reason": reason}
+    with _task_operation_lock(task_id):
+        data = journal.read()
+        if data is None:
+            return None
+        journal_primary = str(data.get("primaryPath") or "").strip()
+        if not journal_primary:
+            reason = "Recovery journal has no primary path identity."
+            _record_blocked_recovery(task_store, data, journal.operation_id, reason)
+            return {"action": "blocked", "reason": reason}
+        try:
+            primary_path = Path(journal_primary).expanduser().resolve(strict=False)
+        except (OSError, ValueError):
+            primary_path = Path(journal_primary)
+        if expected_primary and _resource_lock_key(primary_path) != _resource_lock_key(expected_primary):
+            return None
+        with _resource_operation_lock(primary_path):
+            data = journal.read()
+            if data is None:
+                return None
+            try:
+                task = task_store.load(task_id)
+            except Exception as exc:
+                reason = (
+                    f"Recovery task metadata is unavailable: {exc}. Manual "
+                    "reconciliation is required before Git state can change."
+                )
+                _record_blocked_recovery(
+                    task_store, data, journal.operation_id, reason
+                )
+                return {"action": "blocked", "reason": reason}
+            identity_error = _task_journal_identity_error(task, data)
+            if identity_error:
+                reason = identity_error + " Manual reconciliation is required."
+                _record_blocked_recovery(
+                    task_store, data, journal.operation_id, reason
+                )
+                return {"action": "blocked", "reason": reason}
+            try:
+                outcome = recover_pending_merge(primary_path, journal)
+            except Exception as exc:
+                outcome = {
+                    "action": "blocked",
+                    "reason": f"Recovery probe failed: {exc}. Manual reconciliation is required.",
+                }
+            if outcome is None:
+                return None
+            reason = str(outcome.get("reason") or "Recovery outcome was not classified.")
+            if outcome.get("action") == "blocked":
+                _record_blocked_recovery(task_store, data, journal.operation_id, reason)
+                return outcome
+            try:
+                task = task_store.load(task_id)
+                data = journal.read() or data
+                if outcome.get("action") == "completed":
+                    _persist_completed_merge_journal(
+                        task,
+                        task_store,
+                        journal,
+                        data,
+                        project_id=task.projectId,
+                        recovery_reason=reason,
+                    )
+                else:
+                    _persist_rolled_back_merge_journal(
+                        task, task_store, journal, data, reason
+                    )
+            except Exception as exc:
+                blocked_reason = (
+                    f"Git recovery reached {outcome.get('action')}, but task/audit "
+                    f"persistence could not be proven: {exc}. Manual reconciliation is required."
+                )
+                _record_blocked_recovery(
+                    task_store, data, journal.operation_id, blocked_reason
+                )
+                return {"action": "blocked", "reason": blocked_reason}
+            return outcome
+
+
+def _recover_pending_merges_for_primary(
+    primary_path: Path,
+    task_store: "TaskStore",
+    requesting_task_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Run recovery for every pending merge journal targeting ``primary_path``.
+
+    Codex P1-1 round 19.  Acquires each journal's task lock and then its
+    primary resource lock before recovery so a crash between forward CAS
+    and materialisation on a previous lifecycle is recovered before a
+    new merge attempts to use the same primary repository.  Each
+    recovery outcome is recorded as a separate audit event so the
+    audit trail distinguishes "completed by recovery", "rolled back by
+    recovery", and "blocked — manual reconciliation required".
+
+    Returns the list of recovery outcomes for inspection / testing.
+    Never raises: a recovery failure is surfaced as a ``blocked``
+    outcome and an audit record, not as an exception that would mask
+    the original merge request.
+    """
+    recovery_dir = _merge_recovery_dir(task_store)
+    if not recovery_dir.is_dir():
+        return []
+    outcomes: list[dict[str, Any]] = []
+    try:
+        candidates = sorted(recovery_dir.glob("*.json"))
+    except OSError:
+        return []
+    for journal_file in candidates:
+        operation_id = journal_file.stem
+        try:
+            journal = MergeRecoveryJournal(recovery_dir, operation_id)
+        except ValueError:
+            # Stale / hostile filename — best-effort skip so recovery
+            # does not crash the merge request.
+            continue
+        data = journal.read() or {}
+        outcome = _recover_one_merge_journal(
+            journal, task_store, expected_primary=primary_path
+        )
+        if outcome is not None:
+            outcomes.append(
+                {
+                    "operationId": operation_id,
+                    "taskId": data.get("taskId"),
+                    "primaryPath": data.get("primaryPath"),
+                    "requestingTaskId": requesting_task_id,
+                    **outcome,
+                }
+            )
+    return outcomes
+
+
+def _merge_task_to_main_locked(
+    task_id: str,
+    project_store: ProjectStore,
+    task_store: TaskStore,
+) -> Task:
+    """Inner body of ``merge_task_to_main`` — runs while holding the per-task lock."""
+    # Reload inside the lock so concurrent requests see consistent state.
+    task = task_store.load(task_id)
+    if task.archivedAt:
+        raise ApiError(HTTPStatus.CONFLICT, "Archived tasks cannot be merged.")
+    if task.deletedAt:
+        raise ApiError(HTTPStatus.CONFLICT, "Trashed tasks cannot be merged.")
+    if task.status in RUNNING_TASK_STATUSES:
+        raise ApiError(HTTPStatus.CONFLICT, "Running tasks cannot be merged.")
+    if not task.commitSha:
+        raise ApiError(HTTPStatus.CONFLICT, "Task must be committed before merging.")
+    if task.mergedAt:
+        raise ApiError(HTTPStatus.CONFLICT, "Task has already been merged.")
+    # Codex P1-3 round 19: the GUI merge path must NEVER use the
+    # lower-level ``controlled_merge_to_main`` compatibility mode
+    # (``expected_base_sha`` optional).  When ``reviewedHeadSha`` is
+    # missing or ``reviewedRound`` does not match the current round,
+    # the lower-level reachability + sole-parent checks silently
+    # no-op, which would let unreviewed pre-task commits slip into
+    # the trunk.  Block at the GUI boundary BEFORE any Git call so
+    # the rejection is recorded as ``MERGE_BLOCKED`` with a clear
+    # reason, then re-check after acquiring the resource lock in
+    # case a concurrent flow cleared the reviewed snapshot between
+    # the two checks.
+    reviewed_block = _reviewed_base_block_reason(task)
+    if reviewed_block is not None:
+        task.add_history("MERGE_BLOCKED", reviewed_block)
+        task_store.save(task)
+        raise ApiError(HTTPStatus.CONFLICT, reviewed_block)
+    project = project_store.get_project(task.projectId)
+    repo_id = project.get("repoId") or task.repoId
+    primary_project = _find_primary_project_for_repo(project_store, repo_id, project)
+    if primary_project is None:
+        raise ApiError(HTTPStatus.CONFLICT, "No available primary worktree for this repository.")
+    if primary_project.get("available") is False:
+        raise ApiError(HTTPStatus.CONFLICT, "Primary worktree path is no longer available.")
+    try:
+        primary_path = Path(primary_project["path"]).expanduser().resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise ApiError(HTTPStatus.CONFLICT, "Primary worktree path does not exist.") from exc
+    source_branch = task.worktreeBranch or project.get("branch")
+    if not source_branch:
+        raise ApiError(HTTPStatus.CONFLICT, "Source branch is unknown; cannot merge.")
+    # Codex P1-3 round 16: hold the per-resource lock on the primary
+    # worktree around the actual Git merge so different tasks whose
+    # worktrees share the same primary repository cannot interleave
+    # controlled merge-tree / commit-tree / CAS / materialisation sequences
+    # against the same index and refs.  Reload
+    # the task inside the lock so a concurrent task that merged while we
+    # were waiting is observed and surfaced as a conflict.
+    with _resource_operation_lock(primary_path):
+        task = task_store.load(task_id)
+        if task.archivedAt:
+            raise ApiError(HTTPStatus.CONFLICT, "Archived tasks cannot be merged.")
+        if task.deletedAt:
+            raise ApiError(HTTPStatus.CONFLICT, "Trashed tasks cannot be merged.")
+        if task.status in RUNNING_TASK_STATUSES:
+            raise ApiError(HTTPStatus.CONFLICT, "Running tasks cannot be merged.")
+        if not task.commitSha:
+            raise ApiError(HTTPStatus.CONFLICT, "Task must be committed before merging.")
+        if task.mergedAt:
+            raise ApiError(HTTPStatus.CONFLICT, "Task has already been merged.")
+        # Codex P1-3 round 19: re-check the reviewed baseline after
+        # acquiring the resource lock — a concurrent flow that cleared
+        # the reviewed snapshot while we were waiting on the resource
+        # lock must not slip through.
+        reviewed_block = _reviewed_base_block_reason(task)
+        if reviewed_block is not None:
+            task.add_history("MERGE_BLOCKED", reviewed_block)
+            task_store.save(task)
+            raise ApiError(HTTPStatus.CONFLICT, reviewed_block)
+        # Recovery was attempted before taking this task lock.  Under the
+        # resource lock, fail closed if any same-primary journal remains;
+        # do not acquire another task lock from inside this lock span.
+        pending_operations: list[str] = []
+        recovery_dir = _merge_recovery_dir(task_store)
+        if recovery_dir.is_dir():
+            try:
+                journal_files = sorted(recovery_dir.glob("*.json"))
+            except OSError:
+                journal_files = []
+            for journal_file in journal_files:
+                try:
+                    pending = MergeRecoveryJournal(
+                        recovery_dir, journal_file.stem
+                    ).read()
+                except ValueError:
+                    continue
+                if not pending:
+                    continue
+                try:
+                    same_primary = _resource_lock_key(
+                        Path(str(pending.get("primaryPath") or ""))
+                    ) == _resource_lock_key(primary_path)
+                except (OSError, ValueError):
+                    same_primary = False
+                if same_primary:
+                    pending_operations.append(journal_file.stem)
+        if pending_operations:
+            reason = (
+                "A durable merge recovery journal is still pending for this "
+                "primary repository; refusing a new merge until recovery or "
+                "manual reconciliation completes. Operations: "
+                + ", ".join(pending_operations)
+            )
+            task.add_history("MERGE_BLOCKED", reason)
+            task_store.save(task)
+            raise ApiError(HTTPStatus.CONFLICT, reason)
+        primary_identity = get_git_common_dir(primary_path)
+        if not primary_identity:
+            reason = (
+                "Failed to resolve the primary repository identity; refusing "
+                "to create a recovery journal for an unclassified repository."
+            )
+            task.add_history("MERGE_BLOCKED", reason)
+            task_store.save(task)
+            raise ApiError(HTTPStatus.CONFLICT, reason)
+        operation_id = f"task-{task.id}-round-{task.round}-{int(time.time() * 1000)}"
+        journal = MergeRecoveryJournal(recovery_dir, operation_id)
+        try:
+            # Pass the reviewed commit SHA so the merge refuses to fast-forward
+            # over any commits the user added to the branch externally after the
+            # controlled commit landed.  Pass the reviewed HEAD (captured at
+            # artifact time) so the merge refuses to sweep any unreviewed commits
+            # that pre-date the task into the trunk (Codex P1-1 round 12).
+            # Codex P1-1 round 19: pass the durable recovery journal so a
+            # crash between forward CAS and materialisation can be
+            # deterministically recovered.
+            result = controlled_merge_to_main(
+                primary_path,
+                source_branch,
+                expected_commit_sha=task.commitSha,
+                expected_base_sha=task.reviewedHeadSha,
+                recovery_journal=journal,
+                operation_id=operation_id,
+                task_id=task.id,
+                task_round=task.round,
+                primary_identity=primary_identity,
+            )
+            journal_data = journal.read()
+            if journal_data is None:
+                raise MergeError(
+                    "Merge materialised but its durable recovery journal is "
+                    "missing or unreadable; manual reconciliation is required."
+                )
+            _persist_completed_merge_journal(
+                task,
+                task_store,
+                journal,
+                journal_data,
+                project_id=task.projectId,
+                head_drift_sha=result.get("headDriftSha"),
+            )
+            return task
+        except (MergeError, GitError) as exc:
+            # ``MergeError`` covers the explicit merge safety rejections
+            # (dirty main, missing branch, conflict, branch moved, parent
+            # mismatch).  ``GitError`` covers the underlying read-only
+            # helpers (``get_branch_head``, ``is_ancestor``,
+            # ``get_commit_parents``, ``git_status``, …) which Codex P2-1
+            # round 14 noted would otherwise bypass the ``MERGE_BLOCKED``
+            # history record.  Recording both under the same history event
+            # keeps the audit trail consistent.
+            task.add_history(
+                "MERGE_BLOCKED", str(exc), operationId=operation_id
+            )
+            task_store.save(task)
+            _write_merge_audit_once(
+                "task.merge.blocked",
+                task.id,
+                operation_id,
+                {
+                    "projectId": task.projectId,
+                    "primaryPath": str(primary_path),
+                    "sourceBranch": source_branch,
+                    "sourceCommitSha": task.commitSha,
+                    "reviewedBaseSha": task.reviewedHeadSha,
+                    "reason": str(exc),
+                },
+            )
+            if journal.exists():
+                try:
+                    recovery = recover_pending_merge(primary_path, journal)
+                    if recovery and recovery.get("action") == "rolled_back":
+                        journal.advance("rollback_task_persisted")
+                        journal.advance("rollback_audit_persisted")
+                        journal.delete()
+                    elif recovery and recovery.get("action") == "blocked":
+                        _record_blocked_recovery(
+                            task_store,
+                            journal.read() or {},
+                            operation_id,
+                            str(recovery.get("reason") or exc),
+                        )
+                except Exception as recovery_exc:
+                    _record_blocked_recovery(
+                        task_store,
+                        journal.read() or {},
+                        operation_id,
+                        f"Failed to finalize rolled-back merge journal: {recovery_exc}. "
+                        "Manual reconciliation is required.",
+                    )
+            raise ApiError(HTTPStatus.CONFLICT, str(exc)) from exc
+
+def _find_primary_project_for_repo(
+    project_store: "ProjectStore",
+    repo_id: str | None,
+    fallback: dict[str, Any],
+) -> dict[str, Any] | None:
+    if not repo_id:
+        if fallback.get("worktreeType") == "primary" and fallback.get("available") is not False:
+            return fallback
+        return None
+    projects = project_store.list_projects()
+    primary_match = None
+    for project in projects:
+        if project.get("repoId") != repo_id:
+            continue
+        if project.get("worktreeType") != "primary":
+            continue
+        if project.get("available") is False:
+            continue
+        primary_match = project
+        break
+    if primary_match is None and fallback.get("mainWorktreePath"):
+        for project in projects:
+            if ProjectStore._same_path(
+                str(project.get("path", "")),
+                str(fallback.get("mainWorktreePath", "")),
+            ):
+                if project.get("available") is not False:
+                    return project
+    return primary_match
+
+
 def launch_claude_task(task_id: str, project_store: ProjectStore, task_store: TaskStore):
+    """Launch the Claude CLI window for a task in ``WAITING_FOR_CLAUDE``.
+
+    Codex P1-4 round 18: the full ``load → validate → launch → save``
+    span runs under the per-task ``RLock`` (same as
+    ``commit_task_changes`` / ``merge_task_to_main``).  Without
+    serialisation, duplicate concurrent POSTs to
+    ``/api/tasks/{id}/launch-claude`` can both load the task in
+    ``WAITING_FOR_CLAUDE``, both validate, and both launch CLI
+    windows — the loser then saves its ``Task`` object and overwrites
+    the winner's ``claudeWindow`` metadata, leaving the user with two
+    running CLI windows but only one recorded on the task.
+    """
+    with _task_operation_lock(task_id):
+        return _launch_claude_task_locked(task_id, project_store, task_store)
+
+
+def _launch_claude_task_locked(task_id: str, project_store: ProjectStore, task_store: TaskStore):
     task = task_store.load(task_id)
     validate_task_project(task, project_store)
+    if task.status != Status.WAITING_FOR_CLAUDE:
+        raise StateTransitionError(f"Claude can only be launched from {Status.WAITING_FOR_CLAUDE}.")
     task_dir = task_store.task_dir(task.id)
     prompt_path = task_dir / (
         "CLAUDE_IMPLEMENT_PROMPT.md" if task.round == 1 else f"FIX_PROMPT_ROUND_{task.round}.md"
@@ -677,11 +1978,73 @@ def launch_claude_task(task_id: str, project_store: ProjectStore, task_store: Ta
 
 
 def complete_claude_task(task_id: str, project_store: ProjectStore, task_store: TaskStore):
+    """Collect Claude artifacts and advance the task to ``WAITING_FOR_CODEX``.
+
+    Codex P1-4 round 18: the full ``load → collect artifacts → save``
+    span runs under the per-task ``RLock`` so a concurrent
+    ``launch_claude`` / ``cancel`` / ``archive`` request cannot race
+    the artifact-collection / state-transition flow.  Without the
+    lock, two requests could both observe ``CLAUDE_WINDOW_STARTED``,
+    both compute snapshots, and the loser would overwrite the winner's
+    ``reviewedRound`` / ``reviewedHeadSha`` / etc. metadata with stale
+    values captured mid-flight.
+    """
+    with _task_operation_lock(task_id):
+        return _complete_claude_task_locked(task_id, project_store, task_store)
+
+
+def _complete_claude_task_locked(task_id: str, project_store: ProjectStore, task_store: TaskStore):
     task = task_store.load(task_id)
     project_path = validate_task_project(task, project_store)
     if task.status != Status.CLAUDE_WINDOW_STARTED:
         raise StateTransitionError(f"Claude can only be completed from {Status.CLAUDE_WINDOW_STARTED}.")
     task_dir = task_store.task_dir(task.id)
+
+    # Capture the reviewed snapshot BEFORE artifact collection starts.
+    # ``collect_git_artifacts`` writes the diff/status files Codex will
+    # review, so the snapshot must represent the worktree state at the
+    # exact moment those files are generated.  After artifacts return we
+    # re-compute the snapshot and compare: any drift between the two
+    # means the artifacts Codex reviews and the snapshot we record as
+    # the "reviewed baseline" diverge, in which case the snapshot is
+    # discarded so a later PASS cannot be verified against an
+    # unreviewed state (Codex P1-1 round 11).
+    pre_snapshot: dict[str, str | None] | None
+    try:
+        pre_snapshot = compute_review_snapshot(project_path)
+    except EnvFileChangedError as exc:
+        pre_snapshot = None
+        task.reviewedRound = None
+        task.reviewedHeadSha = None
+        task.reviewedStatusHash = None
+        task.reviewedDiffHash = None
+        task.reviewedTreeSha = None
+        for name in (
+            f"git_status_round_{task.round}.txt",
+            f"git_diff_stat_round_{task.round}.txt",
+            f"git_diff_round_{task.round}.diff",
+        ):
+            if (task_dir / name).exists():
+                task.add_artifact(name, name)
+        task.progress = 20
+        task.activeClient = None
+        task.stage = "git_collection_failed"
+        task.lastActivityAt = utc_now_str()
+        set_task_status(task, Status.FAILED, str(exc))
+        task_store.save(task)
+        return task
+    except GitError as exc:
+        pre_snapshot = None
+        task.reviewedRound = None
+        task.reviewedHeadSha = None
+        task.reviewedStatusHash = None
+        task.reviewedDiffHash = None
+        task.reviewedTreeSha = None
+        task.add_history(
+            "REVIEW_SNAPSHOT_FAILED",
+            f"Failed to capture reviewed Git snapshot before artifact collection: {exc}",
+        )
+
     try:
         git_artifacts = collect_git_artifacts(project_path, task_dir, task.round)
         task.add_artifact(git_artifacts.status_path.name, git_artifacts.status_path.name)
@@ -710,6 +2073,56 @@ def complete_claude_task(task_id: str, project_store: ProjectStore, task_store: 
         set_task_status(task, Status.FAILED, f"Git artifact collection failed: {exc}")
         task_store.save(task)
         return task
+
+    # Capture the reviewed snapshot again AFTER artifact collection and
+    # verify the worktree did not mutate while artifacts were being
+    # generated.  ``collect_git_artifacts`` only reads from the worktree
+    # (never mutates), so on a quiescent worktree the pre- and
+    # post-collection snapshots are identical.  If they differ, an
+    # external editor / process changed the worktree mid-collection and
+    # the artifacts Codex reviews no longer correspond to the recorded
+    # snapshot.  Discard the snapshot in that case so PASS-time
+    # verification blocks instead of approving unreviewed content
+    # (Codex P1-1 round 11).
+    snapshot_persisted = False
+    if pre_snapshot is not None:
+        try:
+            post_snapshot = compute_review_snapshot(project_path)
+        except GitError as exc:
+            post_snapshot = None
+            task.add_history(
+                "REVIEW_SNAPSHOT_FAILED",
+                f"Failed to re-verify reviewed Git snapshot after artifact collection: {exc}",
+            )
+        except EnvFileChangedError as exc:
+            post_snapshot = None
+            task.add_history(
+                "REVIEW_SNAPSHOT_FAILED",
+                f"A .env file appeared during artifact collection: {exc}",
+            )
+        else:
+            if post_snapshot != pre_snapshot:
+                post_snapshot = None
+                task.add_history(
+                    "REVIEW_SNAPSHOT_FAILED",
+                    "Worktree mutated between pre-artifact and post-artifact "
+                    "snapshot capture; the recorded snapshot cannot be trusted "
+                    "to match what Codex reviewed. Re-run Claude completion on a "
+                    "quiescent worktree.",
+                )
+        if post_snapshot is not None:
+            task.reviewedRound = task.round
+            task.reviewedHeadSha = post_snapshot["headSha"]
+            task.reviewedStatusHash = post_snapshot["statusHash"]
+            task.reviewedDiffHash = post_snapshot["diffHash"]
+            task.reviewedTreeSha = post_snapshot.get("treeSha")
+            snapshot_persisted = True
+    if not snapshot_persisted:
+        task.reviewedRound = None
+        task.reviewedHeadSha = None
+        task.reviewedStatusHash = None
+        task.reviewedDiffHash = None
+        task.reviewedTreeSha = None
 
     diff_content = ""
     if git_artifacts.diff_path.is_file():
@@ -743,8 +2156,22 @@ def complete_claude_task(task_id: str, project_store: ProjectStore, task_store: 
 
 
 def launch_codex_task(task_id: str, project_store: ProjectStore, task_store: TaskStore):
+    """Launch the Codex CLI window for a task in ``WAITING_FOR_CODEX``.
+
+    Codex P1-4 round 18: the full ``load → validate → launch → save``
+    span runs under the per-task ``RLock`` (same as
+    ``launch_claude_task``) so duplicate concurrent POSTs cannot both
+    write the marker file and launch CLI windows.
+    """
+    with _task_operation_lock(task_id):
+        return _launch_codex_task_locked(task_id, project_store, task_store)
+
+
+def _launch_codex_task_locked(task_id: str, project_store: ProjectStore, task_store: TaskStore):
     task = task_store.load(task_id)
     validate_task_project(task, project_store)
+    if task.status != Status.WAITING_FOR_CODEX:
+        raise StateTransitionError(f"Codex can only be launched from {Status.WAITING_FOR_CODEX}.")
     task_dir = task_store.task_dir(task.id)
     prompt_path = task_dir / "CODEX_REVIEW_PROMPT.md"
     if not prompt_path.is_file():
@@ -766,7 +2193,85 @@ def launch_codex_task(task_id: str, project_store: ProjectStore, task_store: Tas
     return task
 
 
+def _verify_review_snapshot_at_pass(task, project_store: ProjectStore) -> str | None:
+    """Return a blocking reason if the worktree has drifted since artifact time.
+
+    The reviewed snapshot is captured at artifact-collection time
+    (``complete_claude_task``).  On Codex PASS we must verify the worktree
+    still matches that snapshot so post-artifact edits cannot be smuggled
+    into the "reviewed" state.  Returns ``None`` when the snapshot is
+    present and matches; otherwise returns a short reason string suitable
+    for the task history.  Never raises — Git/path failures are mapped to
+    a blocking reason so the PASS is not silently allowed.
+
+    ``EnvFileChangedError`` is treated as a hard block: the snapshot
+    helper refuses to read ``.env`` bytes/diff content, so the PASS must
+    be rejected with a clear reason instead of falling back to the
+    generic drift / failure path.
+    """
+    if (
+        task.reviewedRound is None
+        or not task.reviewedHeadSha
+        or not task.reviewedStatusHash
+        or not task.reviewedDiffHash
+        or not task.reviewedTreeSha
+    ):
+        return (
+            "No reviewed snapshot exists for this round; cannot verify the "
+            "worktree matches what Codex reviewed. Re-run Claude completion "
+            "to capture a fresh snapshot."
+        )
+    if task.reviewedRound != task.round:
+        return (
+            f"Reviewed snapshot is from round {task.reviewedRound} but current "
+            f"round is {task.round}; the artifacts under review are stale. "
+            "Re-run Claude completion to capture a fresh snapshot."
+        )
+    try:
+        project_path = validate_task_project(task, project_store)
+        current = compute_review_snapshot(project_path)
+    except EnvFileChangedError as exc:
+        # The snapshot helper blocks before reading any .env content; surface
+        # this as a PASS-blocking reason so the user must remove the .env
+        # change before re-running the review cycle.
+        return (
+            f"A .env file is present in the worktree at PASS time; the "
+            f"review snapshot cannot be recomputed without reading .env "
+            f"content. Remove the .env change before PASS. ({exc})"
+        )
+    except (ApiError, GitError) as exc:
+        return f"Failed to recompute review snapshot at PASS time: {exc}"
+    drifts: list[str] = []
+    if task.reviewedHeadSha and current.get("headSha") != task.reviewedHeadSha:
+        drifts.append("HEAD moved since artifact collection")
+    if current.get("statusHash") != task.reviewedStatusHash:
+        drifts.append("git status changed since artifact collection")
+    if current.get("diffHash") != task.reviewedDiffHash:
+        drifts.append("diff changed since artifact collection")
+    if task.reviewedTreeSha and current.get("treeSha") != task.reviewedTreeSha:
+        drifts.append("staged tree changed since artifact collection")
+    if drifts:
+        return (
+            "Worktree drifted from the reviewed PASS snapshot: "
+            + "; ".join(drifts)
+            + ". Revert the drift and re-run Claude completion before PASS."
+        )
+    return None
+
+
 def complete_codex_task(task_id: str, project_store: ProjectStore, task_store: TaskStore):
+    """Process the Codex review output and advance / loop the task.
+
+    Codex P1-4 round 18: the full ``load → validate → mutate → save``
+    span runs under the per-task ``RLock`` so a concurrent
+    ``cancel_task`` / ``archive_task`` cannot race the state transition
+    and overwrite the resulting ``Task`` object with stale metadata.
+    """
+    with _task_operation_lock(task_id):
+        return _complete_codex_task_locked(task_id, project_store, task_store)
+
+
+def _complete_codex_task_locked(task_id: str, project_store: ProjectStore, task_store: TaskStore):
     task = task_store.load(task_id)
     validate_task_project(task, project_store)
     if task.status != Status.CODEX_WINDOW_STARTED:
@@ -808,6 +2313,30 @@ def complete_codex_task(task_id: str, project_store: ProjectStore, task_store: T
     task.add_artifact(review_path.name, review_path.name)
     review_status = str(review["status"])
     if review_status in {Status.PASS, Status.BLOCKED, Status.FAILED}:
+        # On PASS, do NOT overwrite the reviewed snapshot: it was captured
+        # at artifact-collection time so it mirrors exactly what Codex
+        # reviewed.  Verify the worktree still matches that snapshot BEFORE
+        # transitioning out of CODEX_WINDOW_STARTED (the state machine
+        # forbids transitions out of terminal statuses like PASS).  If it
+        # has drifted since the artifacts were collected, the Codex PASS
+        # is invalid for the current worktree state, so block the PASS and
+        # require a fresh review cycle.  Missing / unreadable snapshots
+        # are also blocked because they cannot be trusted.
+        if review_status == Status.PASS:
+            block_reason = _verify_review_snapshot_at_pass(task, project_store)
+            if block_reason:
+                task.progress = 100
+                task.activeClient = None
+                task.stage = "review_drift_blocked"
+                task.lastActivityAt = utc_now_str()
+                task.add_history("REVIEW_DRIFT_BLOCKED", block_reason)
+                set_task_status(
+                    task,
+                    Status.FAILED,
+                    f"PASS blocked: worktree drifted from reviewed snapshot. {block_reason}",
+                )
+                task_store.save(task)
+                return task
         task.progress = 100
         task.activeClient = None
         task.stage = "review_complete"
@@ -839,6 +2368,22 @@ def complete_codex_task(task_id: str, project_store: ProjectStore, task_store: T
 
 
 def cancel_task(task_id: str, task_store: TaskStore):
+    """Cancel a task and mark it as stopped.
+
+    Codex P1-2 round 17: the full ``load → mutate → save`` span runs
+    under the per-task ``RLock`` (same as ``commit_task_changes`` /
+    ``merge_task_to_main``).  Without serialisation, duplicate
+    concurrent POSTs to ``/api/tasks/{id}/cancel`` can both load the
+    task in its pre-cancel state, both run the state transition, and
+    the loser of the race then saves its stale ``Task`` object —
+    overwriting any concurrent ``COMMITTED`` / ``MERGED`` metadata
+    recorded by a request that did not acquire the lock.
+    """
+    with _task_operation_lock(task_id):
+        return _cancel_task_locked(task_id, task_store)
+
+
+def _cancel_task_locked(task_id: str, task_store: TaskStore):
     task = task_store.load(task_id)
     task.progress = 100 if task.progress == 0 else task.progress
     task.activeClient = None
@@ -983,6 +2528,17 @@ def ensure_task_not_running(task) -> None:
 
 
 def archive_task(task_id: str, task_store: TaskStore):
+    """Archive a task, moving it out of the active list without deleting it.
+
+    Codex P1-2 round 17: serialised via the per-task ``RLock`` so a
+    concurrent commit / merge / cancel / restore cannot race the archive
+    and overwrite the resulting ``Task`` object with stale metadata.
+    """
+    with _task_operation_lock(task_id):
+        return _archive_task_locked(task_id, task_store)
+
+
+def _archive_task_locked(task_id: str, task_store: TaskStore):
     task = task_store.load(task_id)
     ensure_task_not_running(task)
     task = task_store.archive(task_id)
@@ -991,12 +2547,34 @@ def archive_task(task_id: str, task_store: TaskStore):
 
 
 def restore_archived_task(task_id: str, task_store: TaskStore):
+    """Restore an archived task back to the active list.
+
+    Codex P1-2 round 17: serialised via the per-task ``RLock`` so a
+    concurrent archive / cancel / move_to_trash cannot race the restore
+    and overwrite the resulting ``Task`` object with stale metadata.
+    """
+    with _task_operation_lock(task_id):
+        return _restore_archived_task_locked(task_id, task_store)
+
+
+def _restore_archived_task_locked(task_id: str, task_store: TaskStore):
     task = task_store.restore_archived(task_id)
     write_audit_log("task.restore_archive", task.id, {"projectId": task.projectId, "status": task.status})
     return task
 
 
 def move_task_to_trash(task_id: str, task_store: TaskStore):
+    """Move a task to the trash directory (soft delete, restorable).
+
+    Codex P1-2 round 17: serialised via the per-task ``RLock`` so a
+    concurrent commit / merge / cancel / archive cannot race the trash
+    and overwrite the resulting ``Task`` object with stale metadata.
+    """
+    with _task_operation_lock(task_id):
+        return _move_task_to_trash_locked(task_id, task_store)
+
+
+def _move_task_to_trash_locked(task_id: str, task_store: TaskStore):
     task = task_store.load(task_id)
     ensure_task_not_running(task)
     task = task_store.move_to_trash(task_id)
@@ -1009,6 +2587,17 @@ def move_task_to_trash(task_id: str, task_store: TaskStore):
 
 
 def restore_task_from_trash(task_id: str, task_store: TaskStore):
+    """Restore a trashed task back to the active list.
+
+    Codex P1-2 round 17: serialised via the per-task ``RLock`` so a
+    concurrent trash / cancel cannot race the restore and overwrite the
+    resulting ``Task`` object with stale metadata.
+    """
+    with _task_operation_lock(task_id):
+        return _restore_task_from_trash_locked(task_id, task_store)
+
+
+def _restore_task_from_trash_locked(task_id: str, task_store: TaskStore):
     task = task_store.restore_from_trash(task_id)
     write_audit_log("task.restore_trash", task.id, {"projectId": task.projectId, "status": task.status})
     return task
@@ -1106,6 +2695,9 @@ class GuiHandler(BaseHTTPRequestHandler):
             elif match := re.fullmatch(r"/api/projects/([^/]+)/initialize", path):
                 project = self.store.get_project(match.group(1))
                 self.send_json({"project": initialize_project(project, self.store)})
+            elif match := re.fullmatch(r"/api/projects/([^/]+)/worktrees", path):
+                result = create_project_worktree(match.group(1), body, self.store)
+                self.send_json(result, HTTPStatus.CREATED)
             elif path == "/api/tasks":
                 task = create_task(body, self.store, self.tasks)
                 self.send_json({"task": task.to_dict()}, HTTPStatus.CREATED)
@@ -1120,6 +2712,12 @@ class GuiHandler(BaseHTTPRequestHandler):
                 self.send_json({"task": task.to_dict()})
             elif match := re.fullmatch(r"/api/tasks/([^/]+)/codex-completed", path):
                 task = complete_codex_task(match.group(1), self.store, self.tasks)
+                self.send_json({"task": task.to_dict()})
+            elif match := re.fullmatch(r"/api/tasks/([^/]+)/commit", path):
+                task = commit_task_changes(match.group(1), body, self.store, self.tasks)
+                self.send_json({"task": task.to_dict()})
+            elif match := re.fullmatch(r"/api/tasks/([^/]+)/merge", path):
+                task = merge_task_to_main(match.group(1), self.store, self.tasks)
                 self.send_json({"task": task.to_dict()})
             elif match := re.fullmatch(r"/api/tasks/([^/]+)/cancel", path):
                 task = cancel_task(match.group(1), self.tasks)
@@ -1144,6 +2742,10 @@ class GuiHandler(BaseHTTPRequestHandler):
         except ApiError as exc:
             self.send_error_json(exc.status, exc.message)
         except DirtyWorkTreeError as exc:
+            self.send_error_json(HTTPStatus.CONFLICT, str(exc))
+        except WorktreeCreationError as exc:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+        except (CommitError, MergeError) as exc:
             self.send_error_json(HTTPStatus.CONFLICT, str(exc))
         except TaskStoreError as exc:
             self.send_error_json(HTTPStatus.NOT_FOUND, str(exc))
@@ -1268,6 +2870,36 @@ def create_server(host: str, port: int) -> ThreadingHTTPServer:
     return ThreadingHTTPServer((host, port), GuiHandler)
 
 
+def _recover_pending_merges_at_startup(
+    task_store: TaskStore | None = None,
+) -> None:
+    """Best-effort recovery sweep for any pending merge journals.
+
+    Codex P1-1 round 19.  Runs once at server startup so a crash
+    between forward CAS and materialisation in a previous session is
+    recovered before any new controlled merge attempt.  Each journal's
+    primary path may differ; the recovery itself is per-primary and
+    each journal is recovered independently via
+    ``recover_pending_merge``.  Outcomes are recorded as audit events.
+    """
+    if task_store is None:
+        task_store = GuiHandler.tasks
+    recovery_dir = _merge_recovery_dir(task_store)
+    if not recovery_dir.is_dir():
+        return
+    try:
+        candidates = sorted(recovery_dir.glob("*.json"))
+    except OSError:
+        return
+    for journal_file in candidates:
+        operation_id = journal_file.stem
+        try:
+            journal = MergeRecoveryJournal(recovery_dir, operation_id)
+        except ValueError:
+            continue
+        _recover_one_merge_journal(journal, task_store)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Local web GUI for the Codex/Claude orchestrator.")
     parser.add_argument("--host", default="127.0.0.1")
@@ -1276,6 +2908,11 @@ def main() -> None:
 
     os.chdir(ROOT)
     STATE_DIR.mkdir(exist_ok=True)
+    # Codex P1-1 round 19: recover any pending merge journals before
+    # the server starts serving requests so a crash between forward CAS
+    # and materialisation in a previous session is handled before a
+    # new merge can race it.
+    _recover_pending_merges_at_startup()
     server = create_server(args.host, args.port)
     print(f"GUI running at http://{args.host}:{args.port}")
     print("Press Ctrl+C to stop.")

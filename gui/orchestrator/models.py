@@ -77,6 +77,30 @@ class Task:
     stage: str = ""
     activeClient: str | None = None
     lastActivityAt: str | None = None
+    repoId: str | None = None
+    worktreeType: str | None = None
+    worktreeBranch: str | None = None
+    commitSha: str | None = None
+    commitShortSha: str | None = None
+    commitMessage: str | None = None
+    committedAt: str | None = None
+    mergedAt: str | None = None
+    mergeCommitSha: str | None = None
+    mergeShortSha: str | None = None
+    mergeTargetBranch: str | None = None
+    mergeSourceBranch: str | None = None
+    # Codex P2-2 round 18: SHA the primary worktree HEAD moved to after
+    # the controlled merge's CAS ref update.  ``None`` on the clean
+    # path; a non-empty SHA signals that the recorded ``mergeCommitSha``
+    # may no longer be the branch tip and forensic review of the audit
+    # trail may need to reconcile the two.  Surfaced on the ``MERGED``
+    # history event and the ``task.merge`` audit log entry when set.
+    headDriftSha: str | None = None
+    reviewedRound: int | None = None
+    reviewedHeadSha: str | None = None
+    reviewedStatusHash: str | None = None
+    reviewedDiffHash: str | None = None
+    reviewedTreeSha: str | None = None
 
     @classmethod
     def create(
@@ -148,6 +172,28 @@ class Task:
                 data["lastActivityAt"] if has_last_activity
                 else (data.get("updatedAt") or data.get("createdAt") or utc_now())
             ),
+            repoId=data.get("repoId"),
+            worktreeType=data.get("worktreeType"),
+            worktreeBranch=data.get("worktreeBranch"),
+            commitSha=data.get("commitSha"),
+            commitShortSha=data.get("commitShortSha"),
+            commitMessage=data.get("commitMessage"),
+            committedAt=data.get("committedAt"),
+            mergedAt=data.get("mergedAt"),
+            mergeCommitSha=data.get("mergeCommitSha"),
+            mergeShortSha=data.get("mergeShortSha"),
+            mergeTargetBranch=data.get("mergeTargetBranch"),
+            mergeSourceBranch=data.get("mergeSourceBranch"),
+            headDriftSha=data.get("headDriftSha"),
+            reviewedRound=(
+                int(data["reviewedRound"])
+                if data.get("reviewedRound") is not None
+                else None
+            ),
+            reviewedHeadSha=data.get("reviewedHeadSha"),
+            reviewedStatusHash=data.get("reviewedStatusHash"),
+            reviewedDiffHash=data.get("reviewedDiffHash"),
+            reviewedTreeSha=data.get("reviewedTreeSha"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -175,6 +221,24 @@ class Task:
             "stage": self.stage,
             "activeClient": self.activeClient,
             "lastActivityAt": self.lastActivityAt,
+            "repoId": self.repoId,
+            "worktreeType": self.worktreeType,
+            "worktreeBranch": self.worktreeBranch,
+            "commitSha": self.commitSha,
+            "commitShortSha": self.commitShortSha,
+            "commitMessage": self.commitMessage,
+            "committedAt": self.committedAt,
+            "mergedAt": self.mergedAt,
+            "mergeCommitSha": self.mergeCommitSha,
+            "mergeShortSha": self.mergeShortSha,
+            "mergeTargetBranch": self.mergeTargetBranch,
+            "mergeSourceBranch": self.mergeSourceBranch,
+            "headDriftSha": self.headDriftSha,
+            "reviewedRound": self.reviewedRound,
+            "reviewedHeadSha": self.reviewedHeadSha,
+            "reviewedStatusHash": self.reviewedStatusHash,
+            "reviewedDiffHash": self.reviewedDiffHash,
+            "reviewedTreeSha": self.reviewedTreeSha,
         }
 
     def add_history(self, event: str, message: str, **extra: Any) -> None:

@@ -20,7 +20,16 @@
             <input id="project-path" name="path" type="text" autocomplete="off" placeholder="例如：E:\work\my-project">
             <button type="submit" title="导入项目">导入</button>
           </div>
-          <p class="field-help">项目会写入本工具的 <code>.gui/projects.json</code> 白名单。</p>
+          <p class="field-help">项目会写入本工具的 <code>.gui/projects.json</code> 白名单。导入主工作区或任一 worktree 时会自动登记同仓库的其它 worktree。</p>
+        </form>
+
+        <form id="add-worktree-form" class="add-worktree" hidden>
+          <label for="worktree-branch">从当前主干创建 worktree</label>
+          <input id="worktree-branch" name="branch" type="text" autocomplete="off" placeholder="分支名，如 feature/short-task" required>
+          <label for="worktree-path" class="sr-only">目标路径</label>
+          <input id="worktree-path" name="path" type="text" autocomplete="off" placeholder="目标绝对路径，例如 E:\work\repo-wt-feat" required>
+          <button type="submit" title="创建 worktree（不会推送、不会删除任何分支）">创建 worktree</button>
+          <p class="field-help">创建后，新 worktree 自动出现在项目树中。本工具不会推送，也不会删除已存在的分支或目录。</p>
         </form>
 
         <div class="project-list" id="project-list"></div>
@@ -110,6 +119,20 @@
             <button id="delete-task-button" class="danger" type="button">删除任务记录</button>
             <button id="restore-trash-task-button" class="secondary" type="button">从回收站恢复</button>
           </div>
+
+          <div class="run-actions task-actions git-actions">
+            <button id="commit-task-button" class="primary" type="button" title="PASS 后一键提交 worktree 改动（不推送）">一键提交</button>
+            <button id="merge-task-button" class="primary" type="button" title="把当前分支合并回主干（不推送、不删分支、不解决冲突）">一键合并主干</button>
+          </div>
+
+          <div id="commit-form" class="commit-form" hidden>
+            <label for="commit-message">提交信息（Git 节点名）</label>
+            <textarea id="commit-message" rows="2" placeholder="例如：feat: implement worktree flow"></textarea>
+            <div class="commit-form-actions">
+              <button id="commit-confirm-button" class="primary" type="button">确认提交</button>
+              <button id="commit-cancel-button" class="secondary" type="button">取消</button>
+            </div>
+          </div>
         </section>
       </section>
 
@@ -138,6 +161,10 @@
               <div><dt>进度</dt><dd><div id="task-progress-container" style="display:none;margin-top:2px;"><div class="progress-bar"><div id="task-progress-fill" class="progress-fill" style="width:0%"></div></div></div><span id="task-progress-label">-</span></dd></div>
               <div class="dl-emphasis"><dt>阶段</dt><dd id="task-stage-label">-</dd></div>
               <div class="dl-emphasis"><dt>运行端</dt><dd id="task-active-client">-</dd></div>
+              <div><dt>Git 仓库</dt><dd id="task-repo-label">-</dd></div>
+              <div><dt>Worktree</dt><dd id="task-worktree-label">-</dd></div>
+              <div><dt>提交</dt><dd id="task-commit-label">-</dd></div>
+              <div><dt>合并</dt><dd id="task-merge-label">-</dd></div>
               <div><dt>创建</dt><dd id="task-created">-</dd></div>
               <div><dt>更新</dt><dd id="task-updated">-</dd></div>
             </dl>

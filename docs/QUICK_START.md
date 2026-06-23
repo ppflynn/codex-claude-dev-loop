@@ -82,6 +82,31 @@ Press Ctrl+C to stop.
 
 > 移除项目（顶栏「移除项目」）只从工具白名单里删除，**不会**动本地文件。
 
+### 2.1 自动识别 worktree（Git 工作树）
+
+如果导入的是一个含有多个 worktree 的 Git 仓库（无论导入主工作树还是某个 worktree），工具会自动发现同仓库的所有 worktree：
+
+- 同一个 Git 仓库的主工作树和 worktree 共享一个稳定的 `repoId`，前端按 `📦 项目名 → 分支/worktree` 的树形结构展示。
+- 点树里的任一 worktree 节点，PLAN、任务列表、任务创建、终端展示都会绑定到该 worktree。
+- 项目列表顶部会标注「主干分支：xxx」和「N 个工作区」，方便识别。
+- 移除项目记录只删除工具登记，**不会**删除本地 worktree 目录或 Git 分支。
+
+---
+
+## 2.5. 创建开发 worktree
+
+1. 在左侧项目树里选中一个「主工作树」（标签为「主工作区」）。
+2. 左下方会出现「从当前主干创建 worktree」表单。
+3. 填写：
+   - 分支名：例如 `feature/short-task`，必须以字母或数字开头，只能包含字母、数字、`.`、`-`、`/`，不能与 `main`/`master`/`develop` 等保留名冲突，不能包含 `.env`。
+   - 目标路径：一个还不存在的绝对路径，且不在主工作树目录下。
+4. 点「创建 worktree」。工具会：
+   - 校验主工作树当前是干净的（dirty 时拒绝）；
+   - 校验目标分支名和路径；
+   - 执行 `git worktree add -b <branch> <path>`；
+   - 新 worktree 自动登记为新的项目节点。
+5. 创建失败时不会留下半成品记录；目标路径也不会被创建。
+
 ---
 
 ## 3. 初始化项目（可选）
@@ -152,6 +177,38 @@ Press Ctrl+C to stop.
 - **回收站**：被「删除任务记录」移走的任务。任务目录会先移到 `.gui/trash/tasks/`，可通过「从回收站恢复」回到当前。
 
 运行中的任务不能归档或删除。
+
+---
+
+## 7.5. PASS 后一键提交 / 合并主干
+
+任务进入 `PASS` 状态后，下方「Git 操作」区会出现两个按钮：
+
+### 一键提交
+
+1. 任务必须是 `PASS`、未在运行、未归档、未在回收站，且尚未提交过。
+2. 点「一键提交」会弹出提交信息输入框（即 Git 节点名）。
+3. 点「确认提交」。工具会：
+   - 校验 worktree 有改动（拒绝空提交）；
+   - 校验改动里没有 `.env`、`.env.*` 或路径段为 `.env` 的文件；
+   - 执行 `git add -A` 和 `git commit -m "<message>"`；
+   - 把 `commitSha`、`commitShortSha`、`commitMessage`、`committedAt` 写入任务 JSON 与 history。
+4. 提交失败时不会误标为已提交，拒绝原因写入任务 history。
+
+### 一键合并主干
+
+1. 任务必须已提交、未在运行、未归档、未在回收站，且尚未合并过。
+2. 点「一键合并主干」会弹出确认对话框。
+3. 确认后工具会：
+   - 校验任务记录里有当前轮次的 reviewed base（`reviewedRound == round` 且 `reviewedHeadSha` 非空），否则拒绝合并；
+   - 在同 `repoId` 下查找可用的主工作树；
+   - 校验主工作树必须干净（dirty 时拒绝）；
+   - 校验源分支必须存在，且本轮受影响路径没有自定义合并驱动或 smudge / process 过滤；
+   - 通过 `git merge-tree --write-tree` 计算合并结果树、`git commit-tree` 构造合并提交对象、`git update-ref HEAD <new> <expected>` 做 compare-and-swap 推进 HEAD、`git read-tree -m -u <old> <new>` 同步 index / 工作区；
+   - 持久化恢复日志覆盖 `merge-tree → commit-tree → CAS update-ref → guarded materialization → task metadata → audit`；全部一致后才删除。重启或下次相关操作会在 `task → repo` 锁序下核对真实 ref / index / worktree，仅在不可变身份完全匹配时完成或反向 CAS；遇到 drift、用户编辑或探测失败时保留日志并要求人工对账；
+   - 冲突在 `git merge-tree` 阶段就拒绝，仓库不会进入 half-merged 状态；
+   - 成功时记录 `mergeCommitSha`、`mergeTargetBranch`、`mergedAt`、`mergeSourceBranch`。
+4. 合并成功后**不会**自动 `git push`、不会删除 worktree、不会删除分支、不会自动解决冲突。这些操作需要用户在自己的终端里手动完成。
 
 ---
 

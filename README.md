@@ -60,6 +60,7 @@ powershell -ExecutionPolicy Bypass -File scripts\start-gui.ps1 -Port 8787
 1. 在左侧「导入项目目录」处粘贴一个 Git 仓库路径，点「导入」。
 2. 在项目列表里点中刚导入的项目，中间区域显示项目信息。
 3. 如果项目还不是协同项目（kind 不是 orchestrator），点顶栏「初始化项目」复制协同脚本和 `docs/` 模板。
+4. 如果导入的是主工作树或任一 worktree，工具会自动发现同仓库的其它 worktree，并在项目列表里按「主干 → 分支/worktree」的树形结构展示。同一个仓库的主工作树和所有 worktree 拥有稳定的 `repoId` 标识，方便切换。
 
 ### 4. 创建任务并运行
 
@@ -69,6 +70,34 @@ powershell -ExecutionPolicy Bypass -File scripts\start-gui.ps1 -Port 8787
 4. 任务进入「等待 Codex」状态后，点「启动 Codex CLI」让 Codex 审查本轮变更。
 5. Codex 退出后页面同样会提示「请点击 Codex 已完成」。
 6. 如果审查结果是 `NEEDS_FIX`，工具会自动生成下一轮修复 prompt 并回到「等待 Claude」；如果是 `PASS`，任务结束。
+
+详细的首次使用步骤见 [`docs/QUICK_START.md`](docs/QUICK_START.md)。
+
+### 5. Worktree 工作流与 PASS 后一键提交/合并
+
+工具内置完整的 Git worktree 开发流，所有变更类 Git 操作只能由 GUI 后端在用户点击明确按钮时触发：
+
+1. 选中一个主工作树（type=primary）项目后，左侧出现「从当前主干创建 worktree」表单。填写分支名（如 `feature/short-task`）和目标路径，点「创建 worktree」即可新建一个开发工作区，新 worktree 会自动出现在项目树中。工具会校验：
+   - 分支名合法（不含 `.env`、不以 `..` 开头、不与主干同名）；
+   - 目标路径不存在且不在主工作树目录下；
+   - 主工作树当前是干净的，否则拒绝创建。
+2. 在 worktree 节点上创建任务、运行 Claude/Codex 流程与普通项目一致。PLAN、任务列表、终端展示都会绑定到该 worktree。
+3. 任务进入 `PASS` 状态后，下方会出现「一键提交」按钮。点击后填写提交信息（即 Git 节点名），工具会：
+   - 校验任务状态必须是 `PASS`，且未在运行、未归档、未在回收站；
+   - 校验 worktree 确实有改动（拒绝空提交）；
+   - 校验改动里没有 `.env`、`.env.*` 或路径段为 `.env` 的文件；
+   - 执行 `git add -A` 和 `git commit -m "<message>"`，把 commit SHA、提交信息和提交时间写入任务 JSON 和 history。
+4. 提交完成后会出现「一键合并主干」按钮。点击后工具会：
+   - 校验任务已提交且未合并；
+   - 校验任务记录里有当前轮次的 reviewed base（`reviewedRound == round` 且 `reviewedHeadSha` 非空），否则拒绝合并；
+   - 找到同 `repoId` 下可用的主工作树；
+   - 校验主工作树必须干净、源分支必须存在，且本轮受影响路径没有自定义合并驱动或 smudge / process 过滤；
+   - 通过 `git merge-tree --write-tree` 计算合并结果树，`git commit-tree` 直接构造合并提交，再用 `git update-ref HEAD <new> <expected>` 做 compare-and-swap 推进 HEAD，最后用 `git read-tree -m -u <old> <new>` 同步 index / 工作区；
+   - 持久化合并恢复日志：依次覆盖 CAS 前后、guarded materialization、任务元数据与审计落盘；全部一致后才删除。崩溃后在 `task → repo` 锁序下核对 ref / index / worktree 与不可变操作身份，能证明一致时完成或反向 CAS，出现 drift 或用户编辑时保留日志并提示人工对账；
+   - 合并被拒绝时不会推进 HEAD；冲突时 `git merge-tree` 直接失败，不需要 `--abort`；
+   - 成功时记录 `mergeCommitSha`、`mergeTargetBranch`、`mergedAt`。
+
+工具**永远不会**执行：`git push`、`git branch -D`、`git reset`、`git clean`、`git worktree remove`、自动解决冲突或自动删除 worktree/分支。需要推送或清理时由用户在自己的终端里手动完成。
 
 详细的首次使用步骤见 [`docs/QUICK_START.md`](docs/QUICK_START.md)。
 
@@ -142,9 +171,12 @@ npm.cmd run compile
 
 - 网页终端是只读镜像，不提供任意命令输入。
 - 终端日志路径由任务 ID、客户端和轮次派生，避免任意路径读取。
-- `.env`、`.env.*` 出现在本轮 diff 中时，工具会拒绝推进任务并提示用户。
-- dirty worktree 时不能创建新任务。
-- 移除项目只会从工具配置中移除，不会删除本地项目文件。
+- `.env`、`.env.*` 出现在本轮 diff 中时，工具会拒绝推进任务并提示用户；提交按钮也会拒绝任何包含 `.env` 路径段的变更。
+- dirty worktree 时不能创建新任务；主工作树 dirty 时不能合并主干。
+- Claude/Codex 的 prompt 中明确禁止 AI 自行运行 `git commit`、`git merge`、`git rebase`、`git push`、`git reset`、`git clean`、`git checkout`、`git switch`、`git restore`、`git branch -D`、`git worktree remove` 等变更类操作；提交、合并、worktree 生命周期只能由 GUI 后端在用户点击明确按钮时触发。
+- 一键合并主干在 `git merge-tree` 阶段就能检测到冲突并直接拒绝，仓库不会被推进到 half-merged 状态；如果 HEAD 已推进但 `read-tree` 同步失败，会反向 CAS 回滚到合并前；进程崩溃时下一次合并或服务重启会按持久化恢复日志自动恢复或回滚，无法判定时保留现场并要求人工对账。
+- 工具不自动执行 `git push`、不自动删除 worktree、不自动删除 Git 分支。
+- 移除项目只会从工具配置中移除，不会删除本地项目文件、worktree 目录或 Git 分支。
 
 ## 测试
 

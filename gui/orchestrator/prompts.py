@@ -27,7 +27,7 @@ REVIEW_SCHEMA_EXAMPLE = {
 SAFETY_RULES = """## Safety Rules
 - Do not read, write, print, summarize, or diff `.env`, `.env.*`, or any file under a path segment named `.env`.
 - Do not modify `.git`.
-- Do not run `git commit`, `git push`, `git reset`, `git clean`, `git checkout`, `git switch`, or `git restore`.
+- Do not run `git commit`, `git merge`, `git rebase`, `git push`, `git reset`, `git clean`, `git checkout`, `git switch`, `git restore`, `git branch -D`, `git tag -d`, `git stash drop`, or `git worktree remove`. Submissions, merges and worktree lifecycle are only performed by the GUI backend when the user clicks the explicit "一键提交"/"一键合并主干" buttons.
 - Do not use destructive cleanup commands.
 - Keep all target-project edits inside the target project root.
 """
