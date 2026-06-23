@@ -656,6 +656,8 @@ def create_task(body: dict[str, Any], project_store: ProjectStore, task_store: T
 def launch_claude_task(task_id: str, project_store: ProjectStore, task_store: TaskStore):
     task = task_store.load(task_id)
     validate_task_project(task, project_store)
+    if task.status != Status.WAITING_FOR_CLAUDE:
+        raise StateTransitionError(f"Claude can only be launched from {Status.WAITING_FOR_CLAUDE}.")
     task_dir = task_store.task_dir(task.id)
     prompt_path = task_dir / (
         "CLAUDE_IMPLEMENT_PROMPT.md" if task.round == 1 else f"FIX_PROMPT_ROUND_{task.round}.md"
@@ -745,6 +747,8 @@ def complete_claude_task(task_id: str, project_store: ProjectStore, task_store: 
 def launch_codex_task(task_id: str, project_store: ProjectStore, task_store: TaskStore):
     task = task_store.load(task_id)
     validate_task_project(task, project_store)
+    if task.status != Status.WAITING_FOR_CODEX:
+        raise StateTransitionError(f"Codex can only be launched from {Status.WAITING_FOR_CODEX}.")
     task_dir = task_store.task_dir(task.id)
     prompt_path = task_dir / "CODEX_REVIEW_PROMPT.md"
     if not prompt_path.is_file():

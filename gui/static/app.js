@@ -6,6 +6,8 @@ const state = {
   taskView: localStorage.getItem("taskView") || "active",
   artifacts: {},
   activeArtifact: null,
+  taskActionPending: false,
+  taskActionPendingMessage: "",
 };
 
 const taskStatusLabels = {
@@ -997,7 +999,7 @@ function renderTaskDetails() {
   $("task-created").textContent = task?.createdAt || "-";
   $("task-updated").textContent = task?.lastActivityAt || task?.updatedAt || "-";
 
-  const stageLabel = labelStage(task?.stage);
+  const stageLabel = state.taskActionPendingMessage || labelStage(task?.stage);
   $("task-stage-label").textContent = stageLabel;
 
   const progress = task?.progress != null ? `${task.progress}%` : "-";
@@ -1097,15 +1099,15 @@ function updateActionStates() {
   $("save-plan-button").disabled = !projectAvailable;
   $("remove-project-button").disabled = !project;
   $("create-task-button").disabled = !projectAvailable || !isActiveView;
-  $("launch-claude-button").disabled = !task || !isActiveView || status !== "WAITING_FOR_CLAUDE";
-  $("claude-completed-button").disabled = !task || !isActiveView || status !== "CLAUDE_WINDOW_STARTED";
-  $("launch-codex-button").disabled = !task || !isActiveView || status !== "WAITING_FOR_CODEX";
-  $("codex-completed-button").disabled = !task || !isActiveView || status !== "CODEX_WINDOW_STARTED";
+  $("launch-claude-button").disabled = state.taskActionPending || !task || !isActiveView || status !== "WAITING_FOR_CLAUDE";
+  $("claude-completed-button").disabled = state.taskActionPending || !task || !isActiveView || status !== "CLAUDE_WINDOW_STARTED";
+  $("launch-codex-button").disabled = state.taskActionPending || !task || !isActiveView || status !== "WAITING_FOR_CODEX";
+  $("codex-completed-button").disabled = state.taskActionPending || !task || !isActiveView || status !== "CODEX_WINDOW_STARTED";
 
   // Clear completion prompts when buttons become disabled
   if ($("claude-completed-button").disabled) $("claude-completed-button").classList.remove("attention-pulse");
   if ($("codex-completed-button").disabled) $("codex-completed-button").classList.remove("attention-pulse");
-  $("cancel-task-button").disabled = !task || !isActiveView || terminalStatuses.has(status);
+  $("cancel-task-button").disabled = state.taskActionPending || !task || !isActiveView || terminalStatuses.has(status);
   $("archive-task-button").disabled = !task || !isActiveView || taskIsRunning;
   $("restore-task-button").disabled = !task || !isArchiveView;
   $("delete-task-button").disabled = !task || !isActiveView || taskIsRunning;
@@ -1259,7 +1261,17 @@ async function createTask(event) {
 
 async function taskAction(endpoint, message) {
   const task = selectedTask();
-  if (!task) return;
+  if (!task || state.taskActionPending) return;
+  state.taskActionPending = true;
+  state.taskActionPendingMessage = {
+    "claude-completed": "正在收集改动并运行测试，请稍候...",
+    "codex-completed": "正在处理审查结果，请稍候...",
+    "launch-claude": "正在启动 Claude...",
+    "launch-codex": "正在启动 Codex...",
+  }[endpoint] || "正在处理，请稍候...";
+  updateActionStates();
+  $("task-stage-label").textContent = state.taskActionPendingMessage;
+  toast(state.taskActionPendingMessage);
   try {
     const data = await api(`/api/tasks/${task.id}/${endpoint}`, { method: "POST", body: "{}" });
     state.selectedTaskId = data.task.id;
@@ -1267,6 +1279,11 @@ async function taskAction(endpoint, message) {
     toast(message);
   } catch (error) {
     toast(error.message);
+  } finally {
+    state.taskActionPending = false;
+    state.taskActionPendingMessage = "";
+    renderTaskDetails();
+    updateActionStates();
   }
 }
 

@@ -165,6 +165,33 @@ class TaskApiCoreTests(unittest.TestCase):
         self.assertTrue((task_store.task_dir(task.id) / "task.json").exists())
         self.assertTrue((task_store.task_dir(task.id) / "CLAUDE_IMPLEMENT_PROMPT.md").exists())
 
+    def test_launch_claude_rejects_non_waiting_state_before_opening_window(self):
+        _root, _project, project_store, task_store = self.make_project_store()
+        task = self.create_waiting_task(project_store, task_store)
+        task.status = Status.WAITING_FOR_CODEX
+        task_store.save(task)
+
+        with mock.patch("gui.server.ClaudeCliWindowAdapter") as adapter:
+            with self.assertRaises(server.StateTransitionError):
+                server.launch_claude_task(task.id, project_store, task_store)
+
+        adapter.assert_not_called()
+
+    def test_launch_codex_rejects_stale_state_before_writing_marker_or_opening_window(self):
+        _root, _project, project_store, task_store = self.make_project_store()
+        task = self.create_waiting_task(project_store, task_store)
+        task.status = Status.CLAUDE_WINDOW_STARTED
+        task_store.save(task)
+        task_dir = task_store.task_dir(task.id)
+        (task_dir / "CODEX_REVIEW_PROMPT.md").write_text("stale prompt", encoding="utf-8")
+
+        with mock.patch("gui.server.CodexCliWindowAdapter") as adapter:
+            with self.assertRaises(server.StateTransitionError):
+                server.launch_codex_task(task.id, project_store, task_store)
+
+        adapter.assert_not_called()
+        self.assertFalse((task_dir / "codex_output_started_round_1.txt").exists())
+
     def test_claude_completed_collects_artifacts_and_generates_codex_prompt(self):
         _root, _project, project_store, task_store = self.make_project_store()
         task = self.create_waiting_task(project_store, task_store)
