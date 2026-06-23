@@ -1,4 +1,22 @@
-先确认现有链路不重做：项目已经通过 gui/orchestrator/cli_window.py 启动 Claude/Codex PowerShell 窗口，把输出写入 .gui/tasks/<task-id>/claude_window_round_N.log 或 codex_window_round_N.log，再由 gui/server.py 的 /api/tasks/{task_id}/terminal/{client}/stream 通过 SSE 推给 gui/static/app.js，最后写进 xterm.js 终端。因此本次优化重点不是新增终端流，而是在 AI 输出中增加稳定的阶段事件，并让前端识别这些事件。
-实施时先在 gui/orchestrator/prompts.py 增加统一的运行进度协议，比如 TASK_PROGRESS_PROTOCOL，要求 Claude/Codex 在读取、运行、修改、验证、审查、写报告、完成时输出 ::task-status{phase="..." message="..."}。然后把协议注入 write_claude_implementation_prompt、write_fix_prompt、write_codex_review_prompt。Codex prompt 要特别强调：运行中可以输出状态事件，但最终响应仍必须是纯 JSON，不能污染 CODEX_REVIEW.json。
-随后在 gui/static/app.js 的终端 SSE chunk 处理逻辑里增加状态事件解析。收到日志 chunk 后，按行识别 ::task-status{...}，把它转成终端里更清楚的显示，例如 [修改中] 正在更新 prompt 生成逻辑，同时更新 Claude/Codex 终端标题 badge 或当前阶段文本。普通 CLI 输出继续原样写进 xterm，不影响现有日志回放、退出码识别和完成按钮提示。样式在 gui/static/styles.css 里保持现在的 VSCode-like 终端风格，只加轻量状态 badge，不做大布局重构。
-最后补测试：验证 prompt 生成结果包含进度协议；验证 Codex review prompt 仍要求最终只输出 JSON；如果前端解析逻辑能抽函数，则给状态事件解析补单元测试，否则至少通过现有后端/CLI window 测试确保日志流、CLI exit code: N、metadata、SSE 行为不退化。验收时跑 py -B -m pytest tests/test_gui_server.py tests/test_cli_window.py -q，必要时再跑全量 pytest 和 VS Code extension compile。
+目标是把当前项目从“扁平项目列表”升级成“Git 工作树控制台”：导入项目后自动识别同一个 Git 仓库下的主工作树和分支 worktree，左侧按主干展开分支；开发任务可以绑定到某个 worktree；Codex 审查 PASS 后，再由用户点击按钮触发受控的 Git 提交和合并。
+实现顺序建议：
+先增强后端 Git worktree 识别
+当前项目已经有 worktreeType / branch / gitCommonDir / mainWorktreePath，下一步要补 repoId / mainProjectId / headSha / worktree列表，让同一个仓库的多个路径能分组。
+
+再改项目导入逻辑
+导入任意一个 Git 路径时，调用 git worktree list --porcelain，自动把同仓库的主工作树和 worktree 都登记到 .gui/projects.json。
+
+再改前端项目列表
+左侧不再平铺，而是按仓库显示树：主干节点可展开，下面是各分支/worktree 节点。任务仍然绑定到具体 worktree 项目 ID。
+
+再加“新建工作树”能力
+在主干节点或项目顶部加按钮，填写分支名和目录，后端执行受控 git worktree add -b ...，成功后自动刷新树。
+
+再加 PASS 后提交
+任务状态 PASS 后显示“一键提交”按钮。用户只填“Git 节点名/提交名”，后端检查 .env、dirty 状态、任务状态，然后执行 git add -A + git commit -m ...。
+
+最后加一键合并主干
+提交成功后显示“一键合并主干”。后端先检查主干工作树干净、目标分支存在、无冲突；无冲突才 merge，有冲突就拒绝并写入任务历史。
+
+安全边界
+Claude/Codex 仍然禁止 git commit / merge / push / reset / clean。提交和合并只能由 GUI 明确按钮触发；不自动 push；不自动删除 worktree；冲突不自动解决。

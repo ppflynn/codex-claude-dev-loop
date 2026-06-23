@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import threading
 import uuid
 from pathlib import Path
@@ -99,15 +101,31 @@ class TaskStore:
             task_dir = self.task_dir(task.id)
             task_dir.mkdir(parents=True, exist_ok=True)
             path = task_dir / "task.json"
-            path.write_text(json.dumps(task.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+            self._atomic_write_task(path, task)
             return task
+
+    @staticmethod
+    def _atomic_write_task(path: Path, task: Task) -> None:
+        """Atomically and durably replace one task JSON document."""
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f"{path.name}.", suffix=".tmp", dir=str(path.parent)
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(task.to_dict(), ensure_ascii=False, indent=2))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, path)
+        except Exception:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+            raise
 
     def _write_task_json(self, task_dir: Path, task: Task) -> None:
         ensure_child_path(task_dir, task_dir / "task.json")
-        (task_dir / "task.json").write_text(
-            json.dumps(task.to_dict(), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        self._atomic_write_task(task_dir / "task.json", task)
 
     def create(
         self,

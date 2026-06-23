@@ -40,6 +40,8 @@ const stageLabels = {
   max_rounds_exhausted: "已达最大轮次",
   cancelled: "已取消",
   git_collection_failed: "Git 收集失败",
+  committed: "已提交",
+  merged: "已合并主干",
 };
 
 const terminalStatuses = new Set(["PASS", "BLOCKED", "FAILED", "CANCELLED"]);
@@ -711,45 +713,120 @@ function renderProjects() {
     return;
   }
 
-  state.projects.forEach((project) => {
-    const button = document.createElement("button");
-    button.type = "button";
-    const isAvailable = project.available !== false;
-    const cls = ["project-item"];
-    if (project.id === state.selectedProjectId) cls.push("active");
-    if (!isAvailable) cls.push("project-unavailable");
-    button.className = cls.join(" ");
-    button.onclick = () => selectProject(project.id);
+  const groups = groupProjectsByRepo(state.projects);
+  groups.forEach((group) => {
+    const container = document.createElement("div");
+    container.className = "repo-group";
+    if (group.repoId) container.dataset.repoId = group.repoId;
 
-    const title = document.createElement("div");
-    title.className = "project-title";
-    let badges = `<span class="kind-pill">${kindLabel(project.kind)}</span>`;
-    const wtLabel = worktreeTypeLabel(project.worktreeType);
-    if (wtLabel) {
-      badges += `<span class="kind-pill ${worktreeTypeClass(project.worktreeType)}">${wtLabel}</span>`;
+    if (group.repoId && (group.primary || group.worktrees.length)) {
+      const header = document.createElement("div");
+      header.className = "repo-group-header";
+      const label = document.createElement("span");
+      label.className = "repo-group-title";
+      const primary = group.primary;
+      const repoName = primary ? primary.name : (group.worktrees[0]?.name || "Git 仓库");
+      label.textContent = `📦 ${repoName}`;
+      header.append(label);
+      if (primary) {
+        const meta = document.createElement("span");
+        meta.className = "repo-group-meta";
+        const parts = [];
+        if (primary.branch) parts.push(`主干分支：${primary.branch}`);
+        parts.push(`${group.worktrees.length + (primary ? 1 : 0)} 个工作区`);
+        meta.textContent = parts.join(" · ");
+        header.append(meta);
+      }
+      container.append(header);
     }
-    if (!isAvailable) {
-      badges += `<span class="kind-pill kind-pill-warn">不可用</span>`;
+
+    if (group.primary) {
+      container.append(renderProjectButton(group.primary, true));
+    } else if (group.solo.length === 0 && group.worktrees.length) {
+      // No primary registered; show a hint banner.
+      const hint = document.createElement("div");
+      hint.className = "repo-group-hint";
+      hint.textContent = "未找到主工作区记录，仅显示已登记的 worktree。";
+      container.append(hint);
     }
-    title.innerHTML = `<span>${escapeHtml(project.name)}</span><span class="pill-group">${badges}</span>`;
+    group.worktrees.forEach((wt) => container.append(renderProjectButton(wt, false)));
+    group.solo.forEach((p) => container.append(renderProjectButton(p, false)));
 
-    const path = document.createElement("div");
-    path.className = "project-path";
-    path.textContent = project.path;
-
-    const meta = document.createElement("div");
-    meta.className = "project-meta";
-    const parts = [];
-    if (project.branch) parts.push(`分支：${project.branch}`);
-    if (project.worktreeType === "worktree" && project.mainWorktreePath) {
-      parts.push(`父项目：${project.mainWorktreePath}`);
-    }
-    if (project.lastResult) parts.push(`上次：${project.lastResult}`);
-    meta.textContent = parts.length ? parts.join("  ·  ") : "可创建本地任务";
-
-    button.append(title, path, meta);
-    list.appendChild(button);
+    list.append(container);
   });
+}
+
+function groupProjectsByRepo(projects) {
+  const order = [];
+  const buckets = new Map();
+  projects.forEach((project) => {
+    const key = project.repoId || `solo-${project.id}`;
+    if (!buckets.has(key)) {
+      buckets.set(key, {
+        repoId: project.repoId || null,
+        primary: null,
+        worktrees: [],
+        solo: [],
+      });
+      order.push(key);
+    }
+    const bucket = buckets.get(key);
+    if (!project.repoId) {
+      bucket.solo.push(project);
+    } else if (project.worktreeType === "primary") {
+      if (!bucket.primary) {
+        bucket.primary = project;
+      } else {
+        bucket.worktrees.push(project);
+      }
+    } else if (project.worktreeType === "worktree") {
+      bucket.worktrees.push(project);
+    } else {
+      bucket.solo.push(project);
+    }
+  });
+  return order.map((key) => buckets.get(key));
+}
+
+function renderProjectButton(project, isPrimary) {
+  const button = document.createElement("button");
+  button.type = "button";
+  const isAvailable = project.available !== false;
+  const cls = ["project-item"];
+  if (isPrimary) cls.push("project-primary");
+  if (project.id === state.selectedProjectId) cls.push("active");
+  if (!isAvailable) cls.push("project-unavailable");
+  button.className = cls.join(" ");
+  button.onclick = () => selectProject(project.id);
+
+  const title = document.createElement("div");
+  title.className = "project-title";
+  let badges = `<span class="kind-pill">${kindLabel(project.kind)}</span>`;
+  const wtLabel = worktreeTypeLabel(project.worktreeType);
+  if (wtLabel) {
+    badges += `<span class="kind-pill ${worktreeTypeClass(project.worktreeType)}">${wtLabel}</span>`;
+  }
+  if (!isAvailable) {
+    badges += `<span class="kind-pill kind-pill-warn">不可用</span>`;
+  }
+  title.innerHTML = `<span>${escapeHtml(project.name)}</span><span class="pill-group">${badges}</span>`;
+
+  const path = document.createElement("div");
+  path.className = "project-path";
+  path.textContent = project.path;
+
+  const meta = document.createElement("div");
+  meta.className = "project-meta";
+  const parts = [];
+  if (project.branch) parts.push(`分支：${project.branch}`);
+  if (project.worktreeType === "worktree" && project.mainWorktreePath) {
+    parts.push(`父项目：${project.mainWorktreePath}`);
+  }
+  if (project.lastResult) parts.push(`上次：${project.lastResult}`);
+  meta.textContent = parts.length ? parts.join("  ·  ") : "可创建本地任务";
+
+  button.append(title, path, meta);
+  return button;
 }
 
 async function selectProject(id) {
@@ -775,6 +852,7 @@ async function loadSelectedProject() {
     if (project.worktreeType === "worktree" && project.mainWorktreePath) {
       parts.push(`父：${project.mainWorktreePath}`);
     }
+    if (project.repoId) parts.push(`仓库：${project.repoId}`);
     if (project.available === false) {
       parts.push("⚠ 路径不存在");
     }
@@ -789,6 +867,7 @@ async function loadSelectedProject() {
   }
 
   $("plan-editor").disabled = !project || project.available === false;
+  updateProjectHeaderActions();
   updateActionStates();
 
   if (!project) {
@@ -1019,6 +1098,29 @@ function renderTaskDetails() {
     $("task-active-client").className = "task-detail-value";
   }
 
+  $("task-repo-label").textContent = task?.repoId || "-";
+  const wtParts = [];
+  if (task?.worktreeType) wtParts.push(worktreeTypeLabel(task.worktreeType) || task.worktreeType);
+  if (task?.worktreeBranch) wtParts.push(`分支：${task.worktreeBranch}`);
+  $("task-worktree-label").textContent = wtParts.length ? wtParts.join(" · ") : "-";
+
+  const commitParts = [];
+  if (task?.commitSha) {
+    const sha = task.commitShortSha || task.commitSha.slice(0, 10);
+    commitParts.push(sha);
+    if (task.committedAt) commitParts.push(formatTime(task.committedAt));
+  }
+  if (task?.commitMessage) commitParts.push(`· ${task.commitMessage}`);
+  $("task-commit-label").textContent = commitParts.length ? commitParts.join(" ") : "-";
+
+  const mergeParts = [];
+  if (task?.mergeCommitSha) {
+    const sha = task.mergeShortSha || task.mergeCommitSha.slice(0, 10);
+    mergeParts.push(`${task.mergeSourceBranch || "?"} → ${task.mergeTargetBranch || "?"} @ ${sha}`);
+    if (task.mergedAt) mergeParts.push(formatTime(task.mergedAt));
+  }
+  $("task-merge-label").textContent = mergeParts.length ? mergeParts.join(" ") : "-";
+
   const history = $("task-history");
   history.textContent = task?.history?.length
     ? task.history.map((item) => `[${item.at}] ${item.event}: ${item.message}`).join("\n")
@@ -1085,6 +1187,19 @@ function renderArtifacts() {
   $("artifact-content").textContent = artifact?.exists ? artifact.content : "这个任务还没有可显示的产物。";
 }
 
+function updateProjectHeaderActions() {
+  const project = selectedProject();
+  const worktreeForm = $("add-worktree-form");
+  if (!worktreeForm) return;
+  const canCreateWorktree = project
+    && project.worktreeType === "primary"
+    && project.available !== false;
+  worktreeForm.hidden = !canCreateWorktree;
+  if (canCreateWorktree) {
+    $("worktree-branch").placeholder = `分支名，例如 feature/${(project.name || "task").toLowerCase().replace(/[^a-z0-9._-]/g, "-").slice(0, 16)}-1`;
+  }
+}
+
 function updateActionStates() {
   const project = selectedProject();
   const task = selectedTask();
@@ -1103,6 +1218,22 @@ function updateActionStates() {
   $("claude-completed-button").disabled = state.taskActionPending || !task || !isActiveView || status !== "CLAUDE_WINDOW_STARTED";
   $("launch-codex-button").disabled = state.taskActionPending || !task || !isActiveView || status !== "WAITING_FOR_CODEX";
   $("codex-completed-button").disabled = state.taskActionPending || !task || !isActiveView || status !== "CODEX_WINDOW_STARTED";
+
+  // Git lifecycle: commit available for PASS tasks (active view only) that
+  // have not been committed yet; merge available for committed tasks that
+  // have not been merged yet.
+  const canCommit = !!task
+    && !state.taskActionPending
+    && isActiveView
+    && status === "PASS"
+    && !task.commitSha;
+  const canMerge = !!task
+    && !state.taskActionPending
+    && isActiveView
+    && !!task.commitSha
+    && !task.mergedAt;
+  $("commit-task-button").disabled = !canCommit;
+  $("merge-task-button").disabled = !canMerge;
 
   // Clear completion prompts when buttons become disabled
   if ($("claude-completed-button").disabled) $("claude-completed-button").classList.remove("attention-pulse");
@@ -1417,6 +1548,7 @@ function escapeHtml(value) {
 
 document.addEventListener("DOMContentLoaded", async () => {
   $("add-project-form").addEventListener("submit", addProject);
+  $("add-worktree-form").addEventListener("submit", addWorktreeFromForm);
   $("initialize-button").addEventListener("click", initializeProject);
   $("remove-project-button").addEventListener("click", removeProject);
   $("toggle-inspector-button").addEventListener("click", toggleInspector);
@@ -1431,6 +1563,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("restore-task-button").addEventListener("click", restoreSelectedTask);
   $("delete-task-button").addEventListener("click", deleteSelectedTask);
   $("restore-trash-task-button").addEventListener("click", restoreTrashTask);
+  $("commit-task-button").addEventListener("click", openCommitForm);
+  $("commit-confirm-button").addEventListener("click", confirmCommitTask);
+  $("commit-cancel-button").addEventListener("click", closeCommitForm);
+  $("merge-task-button").addEventListener("click", mergeSelectedTask);
   $("active-tasks-tab").addEventListener("click", () => setTaskView("active"));
   $("archived-tasks-tab").addEventListener("click", () => setTaskView("archived"));
   $("trash-tasks-tab").addEventListener("click", () => setTaskView("trash"));
@@ -1441,3 +1577,146 @@ document.addEventListener("DOMContentLoaded", async () => {
   renderArtifacts();
   await loadProjects();
 });
+
+async function addWorktreeFromForm(event) {
+  event.preventDefault();
+  const project = selectedProject();
+  if (!project) {
+    toast("请先选择一个主工作区项目");
+    return;
+  }
+  if (project.worktreeType !== "primary") {
+    toast("只能从主工作区创建 worktree");
+    return;
+  }
+  const branch = $("worktree-branch").value.trim();
+  const targetPath = $("worktree-path").value.trim();
+  if (!branch || !targetPath) {
+    toast("分支名和目标路径都必填");
+    return;
+  }
+  try {
+    const data = await api(`/api/projects/${project.id}/worktrees`, {
+      method: "POST",
+      body: JSON.stringify({ branch, path: targetPath }),
+    });
+    $("add-worktree-form").reset();
+    await loadProjects();
+    // Codex P2-1 round 18: branch on ``registeredAutomatically`` so the
+    // partial-success case (worktree created but project registration
+    // failed) is surfaced explicitly rather than presented as a normal
+    // registration.  The previous code always reported success and then
+    // attempted ``selectProject(undefined)``, silently masking the
+    // orphan worktree state and leaving the user with no path to
+    // re-import it.
+    if (data && data.registeredAutomatically === false) {
+      // Partial success: the worktree directory exists on disk but the
+      // backend could not register it as a project.  Do NOT navigate
+      // (there is no project to select); surface the recovery
+      // instructions verbatim so the user can act on them.
+      //
+      // Codex P2-2 round 19: read ``data.path`` first (the top-level
+      // path field the backend now always emits in this branch) and
+      // fall back to ``data.project.path`` only for compatibility
+      // with older backends.  Do NOT call ``selectProject``: there is
+      // no project to select (``data.project`` is ``null``), so any
+      // attempt would either silently no-op or select an unrelated
+      // project whose id we never received.
+      const recovery = String(data.recoveryInstructions || "").trim();
+      const createdPath = (data.path && String(data.path).trim())
+        || (data.project && data.project.path ? String(data.project.path) : "")
+        || "(路径不可用)";
+      const branchLabel = data.branch || branch;
+      // Use ``window.alert`` rather than ``toast`` because the message
+      // is long and must be reproducible: the user needs to copy the
+      // orphan worktree path and follow the recovery instructions.
+      window.alert(
+        [
+          "Worktree 已创建但未能自动注册为项目。",
+          `分支：${branchLabel}`,
+          `路径：${createdPath}`,
+          "",
+          "后续步骤：",
+          recovery || "打开项目列表并手动添加该路径以导入它。",
+        ].join("\n"),
+      );
+      // Also emit a transient toast so the user gets immediate visual
+      // feedback even if they dismiss the alert quickly.
+      toast(`Worktree 已创建（注册失败）：${branchLabel} → ${createdPath}`);
+      return;
+    }
+    if (data?.project?.id) {
+      await selectProject(data.project.id);
+    }
+    toast(`已创建 worktree：${data.branch}`);
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+function openCommitForm() {
+  const task = selectedTask();
+  if (!task) return;
+  if (task.status !== "PASS" || task.commitSha) {
+    toast("只有 PASS 且未提交的任务才能提交");
+    return;
+  }
+  const form = $("commit-form");
+  form.hidden = false;
+  const messageInput = $("commit-message");
+  const defaultName = (task.title || "task").trim().replace(/\s+/g, " ").slice(0, 60);
+  messageInput.value = messageInput.value || defaultName;
+  messageInput.focus();
+  messageInput.select();
+}
+
+function closeCommitForm() {
+  $("commit-form").hidden = true;
+}
+
+async function confirmCommitTask() {
+  const task = selectedTask();
+  if (!task) return;
+  const message = $("commit-message").value.trim();
+  if (!message) {
+    toast("提交信息不能为空");
+    return;
+  }
+  try {
+    await api(`/api/tasks/${task.id}/commit`, {
+      method: "POST",
+      body: JSON.stringify({ message }),
+    });
+    closeCommitForm();
+    await loadTasks();
+    toast("任务改动已提交（未推送）");
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+async function mergeSelectedTask() {
+  const task = selectedTask();
+  if (!task) return;
+  if (!task.commitSha || task.mergedAt) {
+    toast("只有已提交且未合并的任务才能合并");
+    return;
+  }
+  const sourceBranch = task.worktreeBranch || "(未知分支)";
+  const confirmMessage = [
+    `确认把分支 '${sourceBranch}' 合并回主干吗？`,
+    "",
+    "安全边界：",
+    "· 通过 git merge-tree 计算结果、git commit-tree 生成提交、CAS update-ref 推进 HEAD，再 guarded read-tree 物化；恢复日志持续到任务元数据和审计落盘，全程不推送、不删除 worktree 或分支。",
+    "· 主干 dirty、分支缺失、产生冲突、缺少当前轮次的 reviewed base、命中自定义合并驱动 / smudge 过滤时，合并会被拒绝。",
+    "· 重启或下次相关操作会核对真实 ref、index、worktree 和不可变操作身份；仅在完全匹配时完成或反向 CAS，发现 drift、用户编辑或探测失败时保留日志并要求人工对账。",
+  ].join("\n");
+  if (!window.confirm(confirmMessage)) return;
+  try {
+    await api(`/api/tasks/${task.id}/merge`, { method: "POST", body: "{}" });
+    await loadTasks();
+    toast("分支已合并到主干（未推送）");
+  } catch (error) {
+    toast(error.message);
+  }
+}

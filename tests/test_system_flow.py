@@ -2,6 +2,7 @@ import json
 import shutil
 import sys
 import threading
+import time
 import unittest
 import urllib.request
 import uuid
@@ -67,6 +68,14 @@ class HttpSystemFlowTests(unittest.TestCase):
             stack.enter_context(mock.patch("gui.server.assert_clean_work_tree"))
             stack.enter_context(mock.patch("gui.server.collect_git_artifacts", side_effect=fake_collect_git_artifacts))
             stack.enter_context(mock.patch("gui.server.run_tests", side_effect=fake_run_tests))
+            # Snapshot is captured at Claude completion and verified on Codex
+            # PASS.  A stable fake ensures the PASS-time drift check passes.
+            stack.enter_context(
+                mock.patch(
+                    "gui.server.compute_review_snapshot",
+                    side_effect=fake_compute_review_snapshot,
+                )
+            )
             stack.enter_context(
                 mock.patch(
                     "gui.server.load_settings",
@@ -104,6 +113,12 @@ class HttpSystemFlowTests(unittest.TestCase):
             "findings": findings or [],
         }
         path = self.task_store.task_dir(task_id) / "CODEX_REVIEW.json"
+        # Sleep briefly so the review file's mtime is strictly newer than the
+        # codex_output_started marker written by launch-codex.  Without this,
+        # the staleness guard in complete_codex_task (review mtime <= marker
+        # mtime) can race on filesystems with coarse mtime resolution and
+        # reject the freshly written review.
+        time.sleep(0.05)
         path.write_text(json.dumps(review, ensure_ascii=False), encoding="utf-8")
 
     def test_http_pass_flow_runs_from_project_import_to_terminal_pass(self):
@@ -188,6 +203,17 @@ def fake_collect_git_artifacts(_project_path, task_dir, round_number):
     diff_stat_path.write_text(" app.py | 1 +\n", encoding="utf-8")
     diff_path.write_text(f"diff --git a/app.py b/app.py\n+round {round_number}\n", encoding="utf-8")
     return GitArtifacts(status_path, diff_stat_path, diff_path, "", "", "")
+
+
+def fake_compute_review_snapshot(_project_path):
+    # Return a stable, identical snapshot on every call so the PASS-time
+    # drift check passes (Claude-completion snapshot == Codex-PASS snapshot).
+    return {
+        "headSha": "fake-head-sha",
+        "statusHash": "fake-status-hash",
+        "diffHash": "fake-diff-hash",
+        "treeSha": "fake-tree-sha",
+    }
 
 
 def fake_run_tests(_project_path, task_dir, round_number, _command):
